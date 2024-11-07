@@ -1,0 +1,29 @@
+---
+- - :permit
+  - MIT
+  - :who:
+    :why:
+    :versions: []
+    :when: 2024-11-07 21:28:11.590327894 Z
+- - :permit
+  - Apache 2.0
+  - :who:
+    :why:
+    :versions: []
+    :when: 2024-11-07 21:28:16.684622649 Z
+- - :permit
+  - New BSD
+  - :who:
+    :why:
+    :versions: []
+    :when: 2024-11-07 21:28:23.889732966 Z
+- - :permit
+  - ISC
+  - &1
+    :who:
+    :why:
+    :versions: []
+    :when: 2024-11-07 21:28:48.367601220 Z
+- - :permit
+  - Simplified BSD
+  - *1
