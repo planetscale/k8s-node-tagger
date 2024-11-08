@@ -19,7 +19,7 @@ const leaderElectionId = "node-label-controller"
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
-	var labelKeysStr string
+	var labelsStr string
 	var cloudProvider string
 	var jsonLogs bool
 
@@ -27,7 +27,7 @@ func main() {
 
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false, "Enable leader election.") // TODO: should be on by default?
-	flag.StringVar(&labelKeysStr, "label-keys", "", "Comma-separated list of label keys to sync")
+	flag.StringVar(&labelsStr, "labels", "", "Comma-separated list of label keys to sync")
 	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws or gcp)")
 	flag.BoolVar(&jsonLogs, "json", false, "Output logs in JSON format")
 	flag.Parse()
@@ -41,11 +41,11 @@ func main() {
 	ctrl.SetLogger(zap.New(opts...))
 
 	// validate flags
-	if labelKeysStr == "" {
+	if labelsStr == "" {
 		logger.Error(fmt.Errorf("label-keys is required"), "unable to start manager")
 		os.Exit(1)
 	}
-	labels := strings.Split(labelKeysStr, ",")
+	labels := strings.Split(labelsStr, ",")
 	logger.Info("Label keys to sync", "labelKeys", labels)
 
 	if cloudProvider != "aws" && cloudProvider != "gcp" {
