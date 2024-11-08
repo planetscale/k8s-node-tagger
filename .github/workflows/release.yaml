@@ -31,30 +31,49 @@ jobs:
           fetch-depth: 0
 
       - name: Calculate new version with autotag
+        id: autotag
         run: |
           curl -sL https://git.io/autotag-install | sh -s -- -b "${RUNNER_TEMP}/bin"
           set -x
           version=$(${RUNNER_TEMP}/bin/autotag -n)
           echo "version=$version" >> $GITHUB_ENV
+          echo "version=${version}" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3
 
-      - name: Release
-        run: |
-          set -eou pipefail
-          set -x
+      - name: Cache
+        uses: actions/cache@v3
+        id: cache
+        with:
+          path: |
+            go-pkg-mod
+            go-build
+          key: ${{ runner.os }}-go-cache-${{ hashFiles('**/go.sum') }}-v2
 
-          image="ghcr.io/planetscale/k8s-node-tagger:v${version}"
+      - name: inject go caches into docker
+        uses: reproducible-containers/buildkit-cache-dance@v3.1.2
+        with:
+          cache-map: |
+            {
+              "go-pkg-mod": "/go/pkg/mod",
+              "go-build": "/root/.cache/go-build"
+            }
+          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
 
-          git reset --hard && git clean -ffdx && git pull
+      - name: Build and push
+        uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/planetscale/k8s-node-tagger:v${{ steps.autotag.outputs.version }}
 
-          docker buildx build \
-            -t "$image" \
-            --platform linux/amd64,linux/arm64 \
-            --push \
-            .
-
-          gh release create "v${version}" --target main --title "v${version}" --generate-notes
+      - name: Create Release
         env:
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${version}" \
+            --target main \
+            --title "v${version}" \
+            --generate-notes
