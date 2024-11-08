@@ -6,9 +6,10 @@
   ],
   "packageRules": [
     {
-      "description": "Don't pin static image, we do not want its weekly updates.",
+      "description": "Don't pin wolfi images, we do not want every weekly update.",
       "matchPackageNames": [
         "pscale.dev/wolfi-prod/static"
+        "pscale.dev/wolfi-prod/go"
       ],
       "pinDigests": false
     }
