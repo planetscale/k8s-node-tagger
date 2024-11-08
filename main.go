@@ -21,6 +21,7 @@ func main() {
 	var enableLeaderElection bool
 	var labelKeysStr string
 	var cloudProvider string
+	var jsonLogs bool
 
 	logger := ctrl.Log.WithName("main")
 
@@ -28,18 +29,24 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false, "Enable leader election.") // TODO: should be on by default?
 	flag.StringVar(&labelKeysStr, "label-keys", "", "Comma-separated list of label keys to sync")
 	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws or gcp)")
+	flag.BoolVar(&jsonLogs, "json", false, "Output logs in JSON format")
 	flag.Parse()
 
-	// TODO(joem): maybe find a way to make github.com/planetscale/log work here.
-	// TODO(joem): or at minimum, let's make this more configurable: json logs by flag, and verbose/debug flag
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	// setup logger. Use development mode by default or json output if --json is set
+	var opts []zap.Opts
+	opts = append(opts, zap.UseDevMode(!jsonLogs))
+	if jsonLogs {
+		opts = append(opts, zap.JSONEncoder())
+	}
+	ctrl.SetLogger(zap.New(opts...))
 
+	// validate flags
 	if labelKeysStr == "" {
 		logger.Error(fmt.Errorf("label-keys is required"), "unable to start manager")
 		os.Exit(1)
 	}
-
-	labelKeys := strings.Split(labelKeysStr, ",")
+	labels := strings.Split(labelKeysStr, ",")
+	logger.Info("Label keys to sync", "labelKeys", labels)
 
 	if cloudProvider != "aws" && cloudProvider != "gcp" {
 		logger.Error(fmt.Errorf("cloud-provider must be either 'aws' or 'gcp'"), "unable to start manager")
@@ -70,7 +77,7 @@ func main() {
 
 	controller := &NodeLabelController{
 		Client: mgr.GetClient(),
-		Labels: labelKeys,
+		Labels: labels,
 		Cloud:  cloudProvider,
 	}
 
