@@ -22,28 +22,32 @@ import (
 
 type NodeLabelController struct {
 	client.Client
-	awsEC2Client ec2Client
-	gcpGCEClient gceClient
-	labels       []string
-	cloud        string
+	EC2Client ec2Client
+	GCEClient gceClient
+
+	// Labels is a list of label keys to sync from the node to the cloud provider
+	Labels []string
+
+	// Cloud is the cloud provider (aws or gcp)
+	Cloud string
 }
 
 func (r *NodeLabelController) SetupCloudProvider(ctx context.Context) error {
-	switch r.cloud {
+	switch r.Cloud {
 	case "aws":
 		cfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {
 			return fmt.Errorf("unable to load AWS config: %v", err)
 		}
-		r.awsEC2Client = ec2.NewFromConfig(cfg)
+		r.EC2Client = ec2.NewFromConfig(cfg)
 	case "gcp":
 		c, err := gce.NewService(ctx)
 		if err != nil {
 			return fmt.Errorf("unable to create GCP client: %v", err)
 		}
-		r.gcpGCEClient = newGCEComputeClient(c)
+		r.GCEClient = newGCEComputeClient(c)
 	default:
-		return fmt.Errorf("unsupported cloud provider: %q", r.cloud)
+		return fmt.Errorf("unsupported cloud provider: %q", r.Cloud)
 	}
 	return nil
 }
@@ -61,7 +65,7 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return false
 			}
-			return shouldProcessNodeUpdate(oldNode, newNode, r.labels)
+			return shouldProcessNodeUpdate(oldNode, newNode, r.Labels)
 		},
 
 		CreateFunc: func(e event.CreateEvent) bool {
@@ -69,7 +73,7 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return false
 			}
-			return shouldProcessNodeCreate(node, r.labels)
+			return shouldProcessNodeCreate(node, r.Labels)
 		},
 
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -136,14 +140,14 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	labels := make(map[string]string)
-	for _, k := range r.labels {
+	for _, k := range r.Labels {
 		if value, exists := node.Labels[k]; exists {
 			labels[k] = value
 		}
 	}
 
 	var err error
-	switch r.cloud {
+	switch r.Cloud {
 	case "aws":
 		err = r.syncAWSTags(ctx, providerID, labels)
 	case "gcp":
@@ -165,7 +169,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 		return fmt.Errorf("invalid AWS provider ID format: %q", providerID)
 	}
 
-	result, err := r.awsEC2Client.DescribeTags(ctx, &ec2.DescribeTagsInput{
+	result, err := r.EC2Client.DescribeTags(ctx, &ec2.DescribeTagsInput{
 		Filters: []types.Filter{
 			{
 				Name:   aws.String("resource-id"),
@@ -179,7 +183,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 
 	currentTags := make(map[string]string)
 	for _, tag := range result.Tags {
-		if key := aws.ToString(tag.Key); key != "" && slices.Contains(r.labels, key) {
+		if key := aws.ToString(tag.Key); key != "" && slices.Contains(r.Labels, key) {
 			currentTags[key] = aws.ToString(tag.Value)
 		}
 	}
@@ -199,7 +203,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 
 	// find monitored tags to remove
 	for k := range currentTags {
-		if slices.Contains(r.labels, k) {
+		if slices.Contains(r.Labels, k) {
 			if _, exists := desiredLabels[k]; !exists {
 				toDelete = append(toDelete, types.Tag{
 					Key: aws.String(k),
@@ -209,7 +213,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 	}
 
 	if len(toAdd) > 0 {
-		_, err := r.awsEC2Client.CreateTags(ctx, &ec2.CreateTagsInput{
+		_, err := r.EC2Client.CreateTags(ctx, &ec2.CreateTagsInput{
 			Resources: []string{instanceID},
 			Tags:      toAdd,
 		})
@@ -219,7 +223,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 	}
 
 	if len(toDelete) > 0 {
-		_, err := r.awsEC2Client.DeleteTags(ctx, &ec2.DeleteTagsInput{
+		_, err := r.EC2Client.DeleteTags(ctx, &ec2.DeleteTagsInput{
 			Resources: []string{instanceID},
 			Tags:      toDelete,
 		})
@@ -237,7 +241,7 @@ func (r *NodeLabelController) syncGCPLabels(ctx context.Context, providerID stri
 		return fmt.Errorf("failed to parse GCP provider ID: %v", err)
 	}
 
-	instance, err := r.gcpGCEClient.GetInstance(ctx, project, zone, name)
+	instance, err := r.GCEClient.GetInstance(ctx, project, zone, name)
 	if err != nil {
 		return fmt.Errorf("failed to get GCP instance: %v", err)
 	}
@@ -249,7 +253,7 @@ func (r *NodeLabelController) syncGCPLabels(ctx context.Context, providerID stri
 
 	// create a set of sanitized monitored keys for easy lookup
 	monitoredKeys := make(map[string]string) // sanitized -> original
-	for _, k := range r.labels {
+	for _, k := range r.Labels {
 		monitoredKeys[sanitizeKeyForGCP(k)] = k
 	}
 
@@ -272,7 +276,7 @@ func (r *NodeLabelController) syncGCPLabels(ctx context.Context, providerID stri
 		return nil
 	}
 
-	err = r.gcpGCEClient.SetLabels(ctx, project, zone, name, &gce.InstancesSetLabelsRequest{
+	err = r.GCEClient.SetLabels(ctx, project, zone, name, &gce.InstancesSetLabelsRequest{
 		Labels:           newLabels,
 		LabelFingerprint: instance.LabelFingerprint,
 	})

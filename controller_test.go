@@ -125,10 +125,10 @@ func TestReconcileAWS(t *testing.T) {
 			mock := &mockEC2Client{currentTags: tt.currentTags}
 
 			r := &NodeLabelController{
-				Client:       k8s,
-				labels:       tt.labelsToCopy,
-				cloud:        "aws",
-				awsEC2Client: mock,
+				Client:    k8s,
+				Labels:    tt.labelsToCopy,
+				Cloud:     "aws",
+				EC2Client: mock,
 			}
 
 			_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -200,10 +200,10 @@ func TestReconcileGCP(t *testing.T) {
 			mock := &mockGCEClient{instance: &gce.Instance{Labels: tt.currentLabels}}
 
 			r := &NodeLabelController{
-				Client:       k8s,
-				labels:       tt.labelsToCopy,
-				cloud:        "gcp",
-				gcpGCEClient: mock,
+				Client:    k8s,
+				Labels:    tt.labelsToCopy,
+				Cloud:     "gcp",
+				GCEClient: mock,
 			}
 
 			_, err := r.Reconcile(context.Background(), ctrl.Request{

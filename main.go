@@ -70,8 +70,8 @@ func main() {
 
 	controller := &NodeLabelController{
 		Client: mgr.GetClient(),
-		labels: labelKeys,
-		cloud:  cloudProvider,
+		Labels: labelKeys,
+		Cloud:  cloudProvider,
 	}
 
 	ctx := ctrl.SetupSignalHandler()
