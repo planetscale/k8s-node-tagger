@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
@@ -17,7 +18,9 @@ import (
 const leaderElectionId = "node-label-controller"
 
 func main() {
+	var probesAddr string
 	var metricsAddr string
+	var pprofAddr string
 	var enableLeaderElection bool
 	var labelsStr string
 	var cloudProvider string
@@ -25,8 +28,10 @@ func main() {
 
 	logger := ctrl.Log.WithName("main")
 
-	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false, "Enable leader election.") // TODO: should be on by default?
+	flag.StringVar(&probesAddr, "probes-addr", ":8080", "The address the /readyz and /healthz probes endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-addr", ":8081", "The address the metric endpoint binds to.")
+	flag.StringVar(&pprofAddr, "pprof-addr", "", "The address the pprof server endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false, "Enable leader election.")
 	flag.StringVar(&labelsStr, "labels", "", "Comma-separated list of label keys to sync")
 	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws or gcp)")
 	flag.BoolVar(&jsonLogs, "json", false, "Output logs in JSON format")
@@ -53,20 +58,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// get a kubeconfig for the manager to use to access the k8s API:
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
 		logger.Error(err, "unable to get kubeconfig")
 		os.Exit(1)
 	}
 
+	// configure the controller-runtime manager
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme,
+		Scheme:                 scheme,
+		HealthProbeBindAddress: probesAddr,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
 		},
+		PprofBindAddress: pprofAddr,
 		LeaderElection:   enableLeaderElection,
 		LeaderElectionID: leaderElectionId,
 	})
@@ -75,13 +84,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// setup /healthz and /readyz checks on the manager
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		logger.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		logger.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	ctx := ctrl.SetupSignalHandler()
+
+	// setup our controller and start it
 	controller := &NodeLabelController{
 		Client: mgr.GetClient(),
 		Labels: labels,
 		Cloud:  cloudProvider,
 	}
-
-	ctx := ctrl.SetupSignalHandler()
 
 	if err := controller.SetupCloudProvider(ctx); err != nil {
 		logger.Error(err, "unable to setup cloud provider")
