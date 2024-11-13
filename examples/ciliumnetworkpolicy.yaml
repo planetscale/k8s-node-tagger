@@ -1,0 +1,54 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: k8s-node-tagger
+specs:
+  - description: Allow access to AWS STS API
+    endpointSelector:
+      matchLabels:
+        app: k8s-node-tagger
+    egress:
+      - toFQDNs:
+          - matchName: sts.amazonaws.com
+          - matchPattern: sts.*.amazonaws.com
+        toPorts:
+          - ports:
+              - port: "443"
+                protocol: TCP
+
+  - description: Allow access to AWS EC2 API
+    endpointSelector:
+      matchLabels:
+        app: k8s-node-tagger
+    egress:
+      - toFQDNs:
+          - matchName: ec2.amazonaws.com
+          - matchPattern: ec2.*.amazonaws.com
+        toPorts:
+          - ports:
+              - port: "443"
+                protocol: TCP
+
+  - description: Allow access to GCP GCE instance metadata service
+    endpointSelector:
+      matchLabels:
+        app: k8s-node-tagger
+    egress:
+      - toCIDR:
+          - 169.254.169.254/32
+        toPorts:
+          - ports:
+              - port: "80"
+                protocol: TCP
+
+  - description: Allow access to GCP GCE API
+    endpointSelector:
+      matchLabels:
+        app: k8s-node-tagger
+    egress:
+      - toFQDNs:
+          - matchName: compute.googleapis.com
+        toPorts:
+          - ports:
+              - port: "443"
+                protocol: TCP

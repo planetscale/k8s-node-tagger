@@ -1,0 +1,14 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: k8s-node-tagger
+spec:
+  endpoints:
+    - port: metrics
+  jobLabel: jobLabel
+  namespaceSelector:
+    matchNames:
+      - k8s-node-tagger
+  selector:
+    matchLabels:
+      app: k8s-node-tagger
