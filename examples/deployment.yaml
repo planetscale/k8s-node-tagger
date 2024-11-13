@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-node-tagger
+spec:
+  # NOTE: we could do replicas: 2 here. If so, add the '-enable-leader-election' flag
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: k8s-node-tagger
+  template:
+    metadata:
+      labels:
+        app: k8s-node-tagger
+    spec:
+      serviceAccountName: k8s-node-tagger
+      containers:
+        - name: k8s-node-tagger
+          image: ghcr.io/planetscale/k8s-node-tagger:v0.0.15@sha256:7e5074b10cc113afaf6ea17465ad8de2b9b08acf24cc55e98f4eb5aafe4e1982
+          imagePullPolicy: IfNotPresent
+          args:
+            - -cloud=aws
+            # - -cloud=gcp
+            - -labels=database-branch-id,psdb.co/shard,psdb.co/cluster,psdb.co/keyspace,psdb.co/component,psdb.co/size
+            - -json
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              memory: 64Mi

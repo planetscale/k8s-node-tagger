@@ -2,6 +2,10 @@
 
 A Kubernetes controller that watches Kubernetes Nodes and copies labels from the node to the cloud provider's VM as tags (AWS) or labels (GCP).
 
+## Deployment
+
+See the [./examples](./examples) directory for example manifests. These are just examples, please read them carefully and adjust if needed.
+
 ## Testing
 
 - lint: `make lint`
