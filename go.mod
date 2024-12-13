@@ -2,12 +2,12 @@ module github.com/planetscale/k8s-node-tagger
 
 go 1.23.0
 
-toolchain go1.23.3
+toolchain go1.23.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.32.6
 	github.com/aws/aws-sdk-go-v2/config v1.28.6
-	github.com/aws/aws-sdk-go-v2/service/ec2 v1.196.0
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.197.0
 	github.com/stretchr/testify v1.10.0
 	google.golang.org/api v0.211.0
 	k8s.io/api v0.32.0
