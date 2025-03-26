@@ -55,37 +55,92 @@ func (m *mockGCEClient) SetLabels(ctx context.Context, project, zone, instance s
 	return nil
 }
 
+type mockNode struct {
+	Name        string
+	Labels      map[string]string
+	Annotations map[string]string
+	ProviderID  string
+}
+
 func TestReconcileAWS(t *testing.T) {
 	tests := []struct {
-		name         string
-		labelsToCopy []string
-		node         *corev1.Node
-		currentTags  []types.TagDescription
-		createsTags  []types.Tag
-		deletesTags  []types.Tag
+		name              string
+		labelsToCopy      []string
+		annotationsToCopy []string
+		node              mockNode
+		currentTags       []types.TagDescription
+		createsTags       []types.Tag
+		deletesTags       []types.Tag
 	}{
 		{
-			name:         "add new tag",
-			labelsToCopy: []string{"env", "team"},
-			node: createNode("node1",
-				map[string]string{
-					"env":  "prod",
-					"team": "platform",
+			name:              "sync tags from --annotations",
+			annotationsToCopy: []string{"region", "instance-type"},
+			node: mockNode{
+				Name:   "node1",
+				Labels: map[string]string{},
+				Annotations: map[string]string{
+					"region":        "us-east-1",
+					"instance-type": "c5.xlarge",
 				},
-				"aws:///us-east-1a/i-1234567890abcdef0",
-			),
-			currentTags: []types.TagDescription{
-				{Key: aws.String("env"), Value: aws.String("staging")},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
 			},
+			currentTags: []types.TagDescription{},
 			createsTags: []types.Tag{
-				{Key: aws.String("env"), Value: aws.String("prod")},
-				{Key: aws.String("team"), Value: aws.String("platform")},
+				{Key: aws.String("region"), Value: aws.String("us-east-1")},
+				{Key: aws.String("instance-type"), Value: aws.String("c5.xlarge")},
+			},
+		},
+		{
+			name:         "sync tags from --labels",
+			labelsToCopy: []string{"region", "instance-type"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"region":        "us-east-1",
+					"instance-type": "c5.xlarge",
+				},
+				Annotations: map[string]string{},
+				ProviderID:  "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			currentTags: []types.TagDescription{},
+			createsTags: []types.Tag{
+				{Key: aws.String("region"), Value: aws.String("us-east-1")},
+				{Key: aws.String("instance-type"), Value: aws.String("c5.xlarge")},
+			},
+		},
+		{
+			name:              "sync tags from --labels and --annotations",
+			labelsToCopy:      []string{"region", "instance-type"},
+			annotationsToCopy: []string{"team", "cost-center"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"region":        "us-east-1",
+					"instance-type": "c5.xlarge",
+				},
+				Annotations: map[string]string{
+					"team":        "infra",
+					"cost-center": "rev",
+				},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			currentTags: []types.TagDescription{},
+			createsTags: []types.Tag{
+				{Key: aws.String("region"), Value: aws.String("us-east-1")},
+				{Key: aws.String("instance-type"), Value: aws.String("c5.xlarge")},
+				{Key: aws.String("team"), Value: aws.String("infra")},
+				{Key: aws.String("cost-center"), Value: aws.String("rev")},
 			},
 		},
 		{
 			name:         "remove tag",
 			labelsToCopy: []string{"env"},
-			node:         createNode("node1", nil, "aws:///us-east-1a/i-1234567890abcdef0"),
+			node: mockNode{
+				Name:        "node1",
+				ProviderID:  "aws:///us-east-1a/i-1234567890abcdef0",
+				Labels:      map[string]string{}, // node has no labels
+				Annotations: map[string]string{}, // node has no annotations
+			},
 			currentTags: []types.TagDescription{
 				{Key: aws.String("env"), Value: aws.String("prod")},
 			},
@@ -94,14 +149,17 @@ func TestReconcileAWS(t *testing.T) {
 			},
 		},
 		{
-			name:         "preserve unmanaged tags",
-			labelsToCopy: []string{"env"},
-			node: createNode("node1",
-				map[string]string{
+			name:              "preserve unmanaged tags",
+			labelsToCopy:      []string{"env"},
+			annotationsToCopy: []string{},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
 					"env": "prod",
 				},
-				"aws:///us-east-1a/i-1234567890abcdef0",
-			),
+				Annotations: map[string]string{},
+				ProviderID:  "aws:///us-east-1a/i-1234567890abcdef0",
+			},
 			currentTags: []types.TagDescription{
 				{Key: aws.String("env"), Value: aws.String("staging")},
 				{Key: aws.String("cost-center"), Value: aws.String("12345")},
@@ -119,16 +177,17 @@ func TestReconcileAWS(t *testing.T) {
 
 			k8s := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(tt.node).
+				WithObjects(createNode(tt.node)).
 				Build()
 
 			mock := &mockEC2Client{currentTags: tt.currentTags}
 
 			r := &NodeLabelController{
-				Client:    k8s,
-				Labels:    tt.labelsToCopy,
-				Cloud:     "aws",
-				EC2Client: mock,
+				Client:      k8s,
+				Labels:      tt.labelsToCopy,
+				Annotations: tt.annotationsToCopy,
+				Cloud:       "aws",
+				EC2Client:   mock,
 			}
 
 			_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -136,52 +195,107 @@ func TestReconcileAWS(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			assert.Equal(t, tt.createsTags, mock.createdTags)
-			assert.Equal(t, tt.deletesTags, mock.deletedTags)
+			assert.ElementsMatch(t, tt.createsTags, mock.createdTags)
+			assert.ElementsMatch(t, tt.deletesTags, mock.deletedTags)
 		})
 	}
 }
 
 func TestReconcileGCP(t *testing.T) {
 	tests := []struct {
-		name          string
-		labelsToCopy  []string
-		node          *corev1.Node
-		currentLabels map[string]string
-		wantLabels    map[string]string
+		name              string
+		labelsToCopy      []string
+		annotationsToCopy []string
+		node              mockNode
+		currentLabels     map[string]string
+		wantLabels        map[string]string
 	}{
 		{
-			name:          "sync new labels",
-			labelsToCopy:  []string{"env", "team"},
-			node:          createNode("node1", map[string]string{"env": "prod", "team": "platform"}, "gce://my-project/us-central1-a/instance-1"),
-			currentLabels: map[string]string{"env": "staging"},
+			name:              "sync single tag from --annotations",
+			labelsToCopy:      []string{},
+			annotationsToCopy: []string{"region", "instance-type"},
+			node: mockNode{
+				Name: "node1",
+				Annotations: map[string]string{
+					"region":        "us-central1",
+					"instance-type": "n2-standard-4",
+				},
+				ProviderID: "gce://my-project/us-central1-a/instance-1",
+			},
+			currentLabels: map[string]string{},
+			wantLabels: map[string]string{
+				"region":        "us-central1",
+				"instance-type": "n2-standard-4",
+			},
+		},
+		{
+			name:              "sync single tag from --label",
+			labelsToCopy:      []string{"region", "instance-type"},
+			annotationsToCopy: []string{},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"region":        "us-central1",
+					"instance-type": "n2-standard-4",
+				},
+				ProviderID: "gce://my-project/us-central1-a/instance-1",
+			},
+			currentLabels: map[string]string{},
+			wantLabels: map[string]string{
+				"region":        "us-central1",
+				"instance-type": "n2-standard-4",
+			},
+		},
+		{
+			name:              "add new tag from labels",
+			labelsToCopy:      []string{"env", "team"},
+			annotationsToCopy: []string{},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env":  "prod",
+					"team": "platform",
+				},
+				ProviderID: "gce://my-project/us-central1-a/instance-1",
+			},
+			currentLabels: map[string]string{
+				"env": "staging",
+			},
 			wantLabels: map[string]string{
 				"env":  "prod",
 				"team": "platform",
 			},
 		},
 		{
-			name:         "preserve unmanaged labels",
-			labelsToCopy: []string{"env"},
-			node:         createNode("node1", map[string]string{"env": "prod"}, "gce://my-project/us-central1-a/instance-1"),
+			name:              "remove tag",
+			labelsToCopy:      []string{"env"},
+			annotationsToCopy: []string{},
+			node: mockNode{
+				Name:       "node1",
+				ProviderID: "gce://my-project/us-central1-a/instance-1",
+			},
+			currentLabels: map[string]string{
+				"env": "prod",
+			},
+			wantLabels: map[string]string{},
+		},
+		{
+			name:              "preserve unmanaged tags",
+			labelsToCopy:      []string{"env"},
+			annotationsToCopy: []string{},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env": "prod",
+				},
+				ProviderID: "gce://my-project/us-central1-a/instance-1",
+			},
 			currentLabels: map[string]string{
 				"env":         "staging",
 				"cost-center": "12345",
 			},
 			wantLabels: map[string]string{
 				"env":         "prod",
-				"cost-center": "12345",
-			},
-		},
-		{
-			name:         "remove label",
-			labelsToCopy: []string{"env"},
-			node:         createNode("node1", nil, "gce://my-project/us-central1-a/instance-1"),
-			currentLabels: map[string]string{
-				"env":         "prod",
-				"cost-center": "12345",
-			},
-			wantLabels: map[string]string{
 				"cost-center": "12345",
 			},
 		},
@@ -194,16 +308,17 @@ func TestReconcileGCP(t *testing.T) {
 
 			k8s := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(tt.node).
+				WithObjects(createNode(tt.node)).
 				Build()
 
 			mock := &mockGCEClient{instance: &gce.Instance{Labels: tt.currentLabels}}
 
 			r := &NodeLabelController{
-				Client:    k8s,
-				Labels:    tt.labelsToCopy,
-				Cloud:     "gcp",
-				GCEClient: mock,
+				Client:      k8s,
+				Labels:      tt.labelsToCopy,
+				Annotations: tt.annotationsToCopy,
+				Cloud:       "gcp",
+				GCEClient:   mock,
 			}
 
 			_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -218,105 +333,173 @@ func TestReconcileGCP(t *testing.T) {
 
 func TestShouldProcessNodeUpdate(t *testing.T) {
 	tests := []struct {
-		name            string
-		oldLabels       map[string]string
-		newLabels       map[string]string
-		monitoredLabels []string
-		want            bool
+		name                 string
+		oldLabels            map[string]string
+		newLabels            map[string]string
+		oldAnnotations       map[string]string
+		newAnnotations       map[string]string
+		monitoredLabels      []string
+		monitoredAnnotations []string
+		want                 bool
 	}{
 		{
-			name:            "monitored label added",
-			oldLabels:       nil,
-			newLabels:       map[string]string{"env": "prod"},
-			monitoredLabels: []string{"env"},
-			want:            true,
+			name:                 "monitored label added",
+			oldLabels:            nil,
+			newLabels:            map[string]string{"env": "prod"},
+			oldAnnotations:       nil,
+			newAnnotations:       nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 true,
 		},
 		{
-			name:            "monitored label removed",
-			oldLabels:       map[string]string{"env": "prod"},
-			newLabels:       nil,
-			monitoredLabels: []string{"env"},
-			want:            true,
+			name:                 "monitored label removed",
+			oldLabels:            map[string]string{"env": "prod"},
+			newLabels:            nil,
+			oldAnnotations:       nil,
+			newAnnotations:       nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 true,
 		},
 		{
-			name:            "monitored label value changed",
-			oldLabels:       map[string]string{"env": "staging"},
-			newLabels:       map[string]string{"env": "prod"},
-			monitoredLabels: []string{"env"},
-			want:            true,
+			name:                 "monitored label value changed",
+			oldLabels:            map[string]string{"env": "staging"},
+			newLabels:            map[string]string{"env": "prod"},
+			oldAnnotations:       nil,
+			newAnnotations:       nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 true,
 		},
 		{
-			name:            "unmonitored label changed",
-			oldLabels:       map[string]string{"foo": "bar"},
-			newLabels:       map[string]string{"foo": "baz"},
-			monitoredLabels: []string{"env"},
-			want:            false,
+			name:                 "monitored annotation added",
+			oldLabels:            map[string]string{},
+			newLabels:            map[string]string{},
+			oldAnnotations:       nil,
+			newAnnotations:       map[string]string{"region": "us-east-1"},
+			monitoredLabels:      []string{},
+			monitoredAnnotations: []string{"region"},
+			want:                 true,
 		},
 		{
-			name:            "multiple monitored labels, one changed",
-			oldLabels:       map[string]string{"env": "prod", "team": "platform"},
-			newLabels:       map[string]string{"env": "prod", "team": "infra"},
-			monitoredLabels: []string{"env", "team"},
-			want:            true,
+			name:                 "monitored annotation value changed",
+			oldLabels:            map[string]string{},
+			newLabels:            map[string]string{},
+			oldAnnotations:       map[string]string{"region": "us-east-1"},
+			newAnnotations:       map[string]string{"region": "us-west-2"},
+			monitoredLabels:      []string{},
+			monitoredAnnotations: []string{"region"},
+			want:                 true,
+		},
+		{
+			name:                 "unmonitored label changed",
+			oldLabels:            map[string]string{"foo": "bar"},
+			newLabels:            map[string]string{"foo": "baz"},
+			oldAnnotations:       nil,
+			newAnnotations:       nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 false,
+		},
+		{
+			name:                 "multiple monitored labels, one changed",
+			oldLabels:            map[string]string{"env": "prod", "team": "platform"},
+			newLabels:            map[string]string{"env": "prod", "team": "infra"},
+			oldAnnotations:       nil,
+			newAnnotations:       nil,
+			monitoredLabels:      []string{"env", "team"},
+			monitoredAnnotations: []string{},
+			want:                 true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			oldNode := createNode("node1", tt.oldLabels, "")
-			newNode := createNode("node1", tt.newLabels, "")
-			got := shouldProcessNodeUpdate(oldNode, newNode, tt.monitoredLabels)
+			oldNode := createNode(mockNode{
+				Name:        "node1",
+				Labels:      tt.oldLabels,
+				Annotations: tt.oldAnnotations,
+			})
+			newNode := createNode(mockNode{
+				Name:        "node1",
+				Labels:      tt.newLabels,
+				Annotations: tt.newAnnotations,
+			})
+			got := shouldProcessNodeUpdate(oldNode, newNode, tt.monitoredLabels, tt.monitoredAnnotations)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 
 	// extra safety test for nil node input
-	assert.False(t, shouldProcessNodeUpdate(nil, nil, []string{"env"}))
+	assert.False(t, shouldProcessNodeUpdate(nil, nil, []string{"env"}, []string{}))
 }
 
 func TestShouldProcessNodeCreate(t *testing.T) {
 	tests := []struct {
-		name            string
-		labels          map[string]string
-		monitoredLabels []string
-		want            bool
+		name                 string
+		labels               map[string]string
+		annotations          map[string]string
+		monitoredLabels      []string
+		monitoredAnnotations []string
+		want                 bool
 	}{
 		{
-			name:            "node with monitored label",
-			labels:          map[string]string{"env": "prod"},
-			monitoredLabels: []string{"env"},
-			want:            true,
+			name:                 "node with monitored label",
+			labels:               map[string]string{"env": "prod"},
+			annotations:          nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 true,
 		},
 		{
-			name:            "node without monitored label",
-			labels:          map[string]string{"foo": "bar"},
-			monitoredLabels: []string{"env"},
-			want:            false,
+			name:                 "node with monitored annotation",
+			labels:               nil,
+			annotations:          map[string]string{"region": "us-east-1"},
+			monitoredLabels:      []string{},
+			monitoredAnnotations: []string{"region"},
+			want:                 true,
 		},
 		{
-			name:            "node with some monitored labels",
-			labels:          map[string]string{"env": "prod", "foo": "bar", "team": "platform"},
-			monitoredLabels: []string{"env", "team", "region"},
-			want:            true,
+			name:                 "node without monitored label",
+			labels:               map[string]string{"foo": "bar"},
+			annotations:          nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 false,
 		},
 		{
-			name:            "empty labels map",
-			labels:          nil,
-			monitoredLabels: []string{"env"},
-			want:            false,
+			name:                 "node with some monitored labels",
+			labels:               map[string]string{"env": "prod", "foo": "bar", "team": "platform"},
+			annotations:          nil,
+			monitoredLabels:      []string{"env", "team", "region"},
+			monitoredAnnotations: []string{},
+			want:                 true,
+		},
+		{
+			name:                 "empty labels map",
+			labels:               nil,
+			annotations:          nil,
+			monitoredLabels:      []string{"env"},
+			monitoredAnnotations: []string{},
+			want:                 false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			node := createNode("node1", tt.labels, "")
-			got := shouldProcessNodeCreate(node, tt.monitoredLabels)
+			node := createNode(mockNode{
+				Name:        "node1",
+				Labels:      tt.labels,
+				Annotations: tt.annotations,
+			})
+			got := shouldProcessNodeCreate(node, tt.monitoredLabels, tt.monitoredAnnotations)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 
 	// extra safety test for nil node input
-	assert.False(t, shouldProcessNodeCreate(nil, []string{"env"}))
+	assert.False(t, shouldProcessNodeCreate(nil, []string{"env"}, []string{}))
 }
 
 func TestParseGCPProviderID(t *testing.T) {
@@ -463,117 +646,15 @@ func TestSanitizeKeysForGCP(t *testing.T) {
 	}
 }
 
-// ----
-
-// func TestReconcile(t *testing.T) {
-// 	tests := []struct {
-// 		name      string
-// 		node      *corev1.Node
-// 		labelKeys []string
-// 		wantErr   bool
-// 		wantSync  bool // whether we expect cloud API calls
-// 	}{
-// 		{
-// 			name: "node missing provider id",
-// 			node: &corev1.Node{
-// 				ObjectMeta: metav1.ObjectMeta{
-// 					Name:   "node1",
-// 					Labels: map[string]string{"environment": "prod"},
-// 				},
-// 			},
-// 			labelKeys: []string{"environment"},
-// 			wantErr:   false,
-// 			wantSync:  false,
-// 		},
-// 		{
-// 			name: "node with no matching labels",
-// 			node: &corev1.Node{
-// 				ObjectMeta: metav1.ObjectMeta{
-// 					Name:   "node1",
-// 					Labels: map[string]string{"foo": "bar"},
-// 				},
-// 				Spec: corev1.NodeSpec{
-// 					ProviderID: "aws:///us-east-1c/i-123456",
-// 				},
-// 			},
-// 			labelKeys: []string{"environment"},
-// 			wantErr:   false,
-// 			wantSync:  false,
-// 		},
-// 		{
-// 			name: "successful sync",
-// 			node: &corev1.Node{
-// 				ObjectMeta: metav1.ObjectMeta{
-// 					Name: "node1",
-// 					Labels: map[string]string{
-// 						"environment": "prod",
-// 						"team":        "platform",
-// 					},
-// 				},
-// 				Spec: corev1.NodeSpec{
-// 					ProviderID: "aws:///us-east-1c/i-123456",
-// 				},
-// 			},
-// 			labelKeys: []string{"environment", "team"},
-// 			wantErr:   false,
-// 			wantSync:  true,
-// 		},
-// 	}
-
-// 	for _, tt := range tests {
-// 		t.Run(tt.name, func(t *testing.T) {
-// 			// Create a fake client
-// 			scheme := runtime.NewScheme()
-// 			_ = clientgoscheme.AddToScheme(scheme)
-// 			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.node).Build()
-
-// 			// Create a mock AWS client that tracks if CreateTags was called
-// 			mockAWS := &mockEC2Client{
-// 				createTagsCalled: false,
-// 			}
-
-// 			c := &NodeLabelController{
-// 				Client:        fakeClient,
-// 				awsEC2Client:  mockAWS,
-// 				labelKeys:     tt.labelKeys,
-// 				cloudProvider: "aws",
-// 			}
-
-// 			_, err := c.Reconcile(context.Background(), ctrl.Request{
-// 				NamespacedName: types.NamespacedName{
-// 					Name: tt.node.Name,
-// 				},
-// 			})
-
-// 			if (err != nil) != tt.wantErr {
-// 				t.Errorf("Reconcile() error = %v, wantErr %v", err, tt.wantErr)
-// 			}
-
-// 			if mockAWS.createTagsCalled != tt.wantSync {
-// 				t.Errorf("Expected cloud sync = %v, got %v", tt.wantSync, mockAWS.createTagsCalled)
-// 			}
-// 		})
-// 	}
-// }
-
-// // Mock AWS EC2 client
-// type mockEC2Client struct {
-// 	createTagsCalled bool
-// }
-
-// func (m *mockEC2Client) CreateTags(ctx context.Context, params *ec2.CreateTagsInput, optFns ...func(*ec2.Options)) (*ec2.CreateTagsOutput, error) {
-// 	m.createTagsCalled = true
-// 	return &ec2.CreateTagsOutput{}, nil
-// }
-
-func createNode(name string, labels map[string]string, providerID string) *corev1.Node {
+func createNode(config mockNode) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   name,
-			Labels: labels,
+			Name:        config.Name,
+			Labels:      config.Labels,
+			Annotations: config.Annotations,
 		},
 		Spec: corev1.NodeSpec{
-			ProviderID: providerID,
+			ProviderID: config.ProviderID,
 		},
 	}
 }

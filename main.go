@@ -23,6 +23,7 @@ func main() {
 	var pprofAddr string
 	var enableLeaderElection bool
 	var labelsStr string
+	var annotationsStr string
 	var cloudProvider string
 	var jsonLogs bool
 
@@ -33,6 +34,7 @@ func main() {
 	flag.StringVar(&pprofAddr, "pprof-addr", "", "The address the pprof server endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false, "Enable leader election.")
 	flag.StringVar(&labelsStr, "labels", "", "Comma-separated list of label keys to sync")
+	flag.StringVar(&annotationsStr, "annotations", "", "Comma-separated list of annotation keys to sync")
 	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws or gcp)")
 	flag.BoolVar(&jsonLogs, "json", false, "Output logs in JSON format")
 	flag.Parse()
@@ -46,12 +48,22 @@ func main() {
 	ctrl.SetLogger(zap.New(opts...))
 
 	// validate flags
-	if labelsStr == "" {
-		logger.Error(fmt.Errorf("label-keys is required"), "unable to start manager")
+	if labelsStr == "" && annotationsStr == "" {
+		logger.Error(fmt.Errorf("either --labels or --annotations is required"), "unable to start manager")
 		os.Exit(1)
 	}
-	labels := strings.Split(labelsStr, ",")
-	logger.Info("Label keys to sync", "labelKeys", labels)
+	
+	var labels []string
+	if labelsStr != "" {
+		labels = strings.Split(labelsStr, ",")
+		logger.Info("Label keys to sync", "labelKeys", labels)
+	}
+	
+	var annotations []string
+	if annotationsStr != "" {
+		annotations = strings.Split(annotationsStr, ",")
+		logger.Info("Annotation keys to sync", "annotationKeys", annotations)
+	}
 
 	if cloudProvider != "aws" && cloudProvider != "gcp" {
 		logger.Error(fmt.Errorf("cloud-provider must be either 'aws' or 'gcp'"), "unable to start manager")
@@ -98,9 +110,10 @@ func main() {
 
 	// setup our controller and start it
 	controller := &NodeLabelController{
-		Client: mgr.GetClient(),
-		Labels: labels,
-		Cloud:  cloudProvider,
+		Client:      mgr.GetClient(),
+		Labels:      labels,
+		Annotations: annotations,
+		Cloud:       cloudProvider,
 	}
 
 	if err := controller.SetupCloudProvider(ctx); err != nil {

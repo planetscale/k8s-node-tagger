@@ -6,6 +6,18 @@ A Kubernetes controller that watches Kubernetes Nodes and copies labels from the
 
 See the [./examples](./examples) directory for example manifests. These are just examples, please read them carefully and adjust if needed.
 
+## Command-line Flags
+
+- `-cloud`: Cloud provider to use (`aws` or `gcp`). Required.
+- `-labels`: Comma-separated list of node label keys to sync to cloud provider tags.
+- `-annotations`: Comma-separated list of node annotation keys to sync to cloud provider tags.
+- `-json`: Output logs in JSON format.
+- `-enable-leader-election`: Enable leader election for controller manager.
+- `-metrics-addr`: The address the metric endpoint binds to (default ":8081").
+- `-probes-addr`: The address the /readyz and /healthz probes endpoint binds to (default ":8080").
+
+Either `-labels` or `-annotations` must be specified.
+
 ## Testing
 
 - lint: `make lint`
