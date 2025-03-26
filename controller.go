@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"maps"
 	"path"
-	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -27,6 +26,9 @@ type NodeLabelController struct {
 
 	// Labels is a list of label keys to sync from the node to the cloud provider
 	Labels []string
+
+	// Annotations is a list of annotation keys to sync from the node to the cloud provider
+	Annotations []string
 
 	// Cloud is the cloud provider (aws or gcp)
 	Cloud string
@@ -54,8 +56,8 @@ func (r *NodeLabelController) SetupCloudProvider(ctx context.Context) error {
 
 func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 	// to reduce the number of API calls to AWS and GCP, filter out node events that
-	// do not involve changes to the monitored label set (r.labels).
-	labelChangePredicate := predicate.Funcs{
+	// do not involve changes to the monitored label or annotation sets.
+	changePredicate := predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldNode, ok := e.ObjectOld.(*corev1.Node)
 			if !ok {
@@ -65,7 +67,7 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return false
 			}
-			return shouldProcessNodeUpdate(oldNode, newNode, r.Labels)
+			return shouldProcessNodeUpdate(oldNode, newNode, r.Labels, r.Annotations)
 		},
 
 		CreateFunc: func(e event.CreateEvent) bool {
@@ -73,7 +75,7 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return false
 			}
-			return shouldProcessNodeCreate(node, r.Labels)
+			return shouldProcessNodeCreate(node, r.Labels, r.Annotations)
 		},
 
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -87,21 +89,46 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}).
-		WithEventFilter(labelChangePredicate).
+		WithEventFilter(changePredicate).
 		Complete(r)
 }
 
 // shouldProcessNodeUpdate determines if a node update event should trigger reconciliation
-// based on whether any monitored labels have changed.
-func shouldProcessNodeUpdate(oldNode, newNode *corev1.Node, monitoredLabels []string) bool {
+// based on whether any monitored labels or annotations have changed.
+func shouldProcessNodeUpdate(oldNode, newNode *corev1.Node, monitoredLabels, monitoredAnnotations []string) bool {
 	if oldNode == nil || newNode == nil {
 		return false
 	}
 
 	// Check if any monitored labels changed
 	for _, k := range monitoredLabels {
-		newVal, newExists := newNode.Labels[k]
-		oldVal, oldExists := oldNode.Labels[k]
+		newVal, newExists := "", false
+		oldVal, oldExists := "", false
+
+		if newNode.Labels != nil {
+			newVal, newExists = newNode.Labels[k]
+		}
+		if oldNode.Labels != nil {
+			oldVal, oldExists = oldNode.Labels[k]
+		}
+
+		if newExists != oldExists || (newExists && newVal != oldVal) {
+			return true
+		}
+	}
+
+	// Check if any monitored annotations changed
+	for _, k := range monitoredAnnotations {
+		newVal, newExists := "", false
+		oldVal, oldExists := "", false
+
+		if newNode.Annotations != nil {
+			newVal, newExists = newNode.Annotations[k]
+		}
+		if oldNode.Annotations != nil {
+			oldVal, oldExists = oldNode.Annotations[k]
+		}
+
 		if newExists != oldExists || (newExists && newVal != oldVal) {
 			return true
 		}
@@ -110,15 +137,27 @@ func shouldProcessNodeUpdate(oldNode, newNode *corev1.Node, monitoredLabels []st
 }
 
 // shouldProcessNodeCreate determines if a newly created node should trigger reconciliation
-// based on whether it has any of the monitored labels.
-func shouldProcessNodeCreate(node *corev1.Node, monitoredLabels []string) bool {
+// based on whether it has any of the monitored labels or annotations.
+func shouldProcessNodeCreate(node *corev1.Node, monitoredLabels, monitoredAnnotations []string) bool {
 	if node == nil {
 		return false
 	}
 
-	for _, k := range monitoredLabels {
-		if _, ok := node.Labels[k]; ok {
-			return true
+	// Check if node has any monitored labels
+	if node.Labels != nil {
+		for _, k := range monitoredLabels {
+			if _, ok := node.Labels[k]; ok {
+				return true
+			}
+		}
+	}
+
+	// Check if node has any monitored annotations
+	if node.Annotations != nil {
+		for _, k := range monitoredAnnotations {
+			if _, ok := node.Annotations[k]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -139,31 +178,45 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	labels := make(map[string]string)
-	for _, k := range r.Labels {
-		if value, exists := node.Labels[k]; exists {
-			labels[k] = value
+	// Create a map for tags to sync with the cloud provider
+	tagsToSync := make(map[string]string)
+
+	// First collect labels (may be overwritten by annotations with same key)
+	if node.Labels != nil {
+		for _, k := range r.Labels {
+			if value, exists := node.Labels[k]; exists {
+				tagsToSync[k] = value
+			}
+		}
+	}
+
+	// Then collect annotations (will overwrite labels with same key)
+	if node.Annotations != nil {
+		for _, k := range r.Annotations {
+			if value, exists := node.Annotations[k]; exists {
+				tagsToSync[k] = value
+			}
 		}
 	}
 
 	var err error
 	switch r.Cloud {
 	case "aws":
-		err = r.syncAWSTags(ctx, providerID, labels)
+		err = r.syncAWSTags(ctx, providerID, tagsToSync)
 	case "gcp":
-		err = r.syncGCPLabels(ctx, providerID, labels)
+		err = r.syncGCPLabels(ctx, providerID, tagsToSync)
 	}
 
 	if err != nil {
-		logger.Error(err, "failed to sync labels")
+		logger.Error(err, "failed to sync tags")
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully synced labels to cloud provider", "labels", labels)
+	logger.Info("Successfully synced tags to cloud provider", "tags", tagsToSync)
 	return ctrl.Result{}, nil
 }
 
-func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string, desiredLabels map[string]string) error {
+func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string, desiredTags map[string]string) error {
 	instanceID := path.Base(providerID)
 	if instanceID == "" {
 		return fmt.Errorf("invalid AWS provider ID format: %q", providerID)
@@ -181,9 +234,19 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 		return fmt.Errorf("failed to fetch node's current AWS tags: %v", err)
 	}
 
+	// Create a set of all monitored keys (both labels and annotations)
+	monitoredKeys := make(map[string]bool)
+	for _, k := range r.Labels {
+		monitoredKeys[k] = true
+	}
+	for _, k := range r.Annotations {
+		monitoredKeys[k] = true
+	}
+
 	currentTags := make(map[string]string)
 	for _, tag := range result.Tags {
-		if key := aws.ToString(tag.Key); key != "" && slices.Contains(r.Labels, key) {
+		key := aws.ToString(tag.Key)
+		if key != "" && monitoredKeys[key] {
 			currentTags[key] = aws.ToString(tag.Value)
 		}
 	}
@@ -192,7 +255,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 	toDelete := make([]types.Tag, 0)
 
 	// find tags to add or update
-	for k, v := range desiredLabels {
+	for k, v := range desiredTags {
 		if curr, exists := currentTags[k]; !exists || curr != v {
 			toAdd = append(toAdd, types.Tag{
 				Key:   aws.String(k),
@@ -203,8 +266,8 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 
 	// find monitored tags to remove
 	for k := range currentTags {
-		if slices.Contains(r.Labels, k) {
-			if _, exists := desiredLabels[k]; !exists {
+		if monitoredKeys[k] {
+			if _, exists := desiredTags[k]; !exists {
 				toDelete = append(toDelete, types.Tag{
 					Key: aws.String(k),
 				})
@@ -235,7 +298,7 @@ func (r *NodeLabelController) syncAWSTags(ctx context.Context, providerID string
 	return nil
 }
 
-func (r *NodeLabelController) syncGCPLabels(ctx context.Context, providerID string, desiredLabels map[string]string) error {
+func (r *NodeLabelController) syncGCPLabels(ctx context.Context, providerID string, desiredTags map[string]string) error {
 	project, zone, name, err := parseGCPProviderID(providerID)
 	if err != nil {
 		return fmt.Errorf("failed to parse GCP provider ID: %v", err)
@@ -251,23 +314,28 @@ func (r *NodeLabelController) syncGCPLabels(ctx context.Context, providerID stri
 		newLabels = make(map[string]string)
 	}
 
+	// Create a set of all monitored keys (both labels and annotations)
+	allMonitoredKeys := make([]string, 0, len(r.Labels)+len(r.Annotations))
+	allMonitoredKeys = append(allMonitoredKeys, r.Labels...)
+	allMonitoredKeys = append(allMonitoredKeys, r.Annotations...)
+
 	// create a set of sanitized monitored keys for easy lookup
 	monitoredKeys := make(map[string]string) // sanitized -> original
-	for _, k := range r.Labels {
+	for _, k := range allMonitoredKeys {
 		monitoredKeys[sanitizeKeyForGCP(k)] = k
 	}
 
 	// remove any existing monitored labels that are no longer desired
 	for k := range newLabels {
 		if orig, isMonitored := monitoredKeys[k]; isMonitored {
-			if _, exists := desiredLabels[orig]; !exists {
+			if _, exists := desiredTags[orig]; !exists {
 				delete(newLabels, k)
 			}
 		}
 	}
 
-	// add or update desired labels
-	for k, v := range desiredLabels {
+	// add or update desired tags
+	for k, v := range desiredTags {
 		newLabels[sanitizeKeyForGCP(k)] = sanitizeValueForGCP(v)
 	}
 

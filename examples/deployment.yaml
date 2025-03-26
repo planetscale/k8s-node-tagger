@@ -23,6 +23,7 @@ spec:
             - -cloud=aws
             # - -cloud=gcp
             - -labels=database-branch-id,psdb.co/shard,psdb.co/cluster,psdb.co/keyspace,psdb.co/component,psdb.co/size
+            - -annotations=foo.bar/baz,foo.bar/qux
             - -json
           ports:
             - name: http
