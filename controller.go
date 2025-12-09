@@ -204,30 +204,31 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Create a map for tags to sync with the cloud provider
 	tagsToSync := make(map[string]string)
+	var notFoundLabels, notFoundAnnotations []string
 
 	// First collect labels (may be overwritten by annotations with same key)
-	if node.Labels != nil {
-		for _, k := range r.Labels {
-			if value, exists := node.Labels[k]; exists {
-				tagsToSync[k] = value
-			} else {
-				logger.V(1).Info("Monitored label not found on node", "label", k)
-			}
+	for _, k := range r.Labels {
+		if value, exists := node.Labels[k]; exists {
+			tagsToSync[k] = value
+		} else {
+			notFoundLabels = append(notFoundLabels, k)
 		}
 	}
 
 	// Then collect annotations (will overwrite labels with same key)
-	if node.Annotations != nil {
-		for _, k := range r.Annotations {
-			if value, exists := node.Annotations[k]; exists {
-				tagsToSync[k] = value
-			} else {
-				logger.V(1).Info("Monitored annotation not found on node", "annotation", k)
-			}
+	for _, k := range r.Annotations {
+		if value, exists := node.Annotations[k]; exists {
+			tagsToSync[k] = value
+		} else {
+			notFoundAnnotations = append(notFoundAnnotations, k)
 		}
 	}
 
-	logger.V(1).Info("Collected tags to sync", "tagsToSync", tagsToSync, "monitoredLabels", r.Labels, "monitoredAnnotations", r.Annotations)
+	logger.V(1).Info("Collected tags to sync",
+		"tagsToSync", tagsToSync,
+		"notFoundLabels", notFoundLabels,
+		"notFoundAnnotations", notFoundAnnotations,
+	)
 
 	var err error
 	switch r.Cloud {
