@@ -238,11 +238,11 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	if err != nil {
-		logger.Error(err, "failed to sync tags")
+		logger.Error(err, "failed to sync tags", "providerID", providerID)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully synced tags to cloud provider", "tags", tagsToSync)
+	logger.Info("Successfully synced tags to cloud provider", "providerID", providerID, "tags", tagsToSync)
 	return ctrl.Result{}, nil
 }
 
