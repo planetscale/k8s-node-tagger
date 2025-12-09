@@ -11,6 +11,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/go-logr/logr"
 	gce "google.golang.org/api/compute/v1"
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -21,6 +22,7 @@ import (
 
 type NodeLabelController struct {
 	client.Client
+	Logger    logr.Logger
 	EC2Client ec2Client
 	GCEClient gceClient
 
@@ -67,7 +69,22 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return false
 			}
-			return shouldProcessNodeUpdate(oldNode, newNode, r.Labels, r.Annotations)
+
+			// Process if any monitored label/annotation changed
+			if shouldProcessNodeUpdate(oldNode, newNode, r.Labels, r.Annotations) {
+				r.Logger.V(1).Info("Update event: label changed", "node", newNode.Name)
+				return true
+			}
+
+			// Also process if node has monitored labels (catches resync events).
+			// During resync, old == new, so shouldProcessNodeUpdate returns false,
+			// but we still want to reconcile to catch any missed events.
+			if shouldProcessNodeCreate(newNode, r.Labels, r.Annotations) {
+				r.Logger.V(1).Info("Update event: resync", "node", newNode.Name)
+				return true
+			}
+
+			return false
 		},
 
 		CreateFunc: func(e event.CreateEvent) bool {
@@ -75,7 +92,14 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 			if !ok {
 				return false
 			}
-			return shouldProcessNodeCreate(node, r.Labels, r.Annotations)
+			shouldProcess := shouldProcessNodeCreate(node, r.Labels, r.Annotations)
+			r.Logger.V(1).Info("Create event",
+				"node", node.Name,
+				"shouldProcess", shouldProcess,
+				"labels", node.Labels,
+				"monitoredLabels", r.Labels,
+			)
+			return shouldProcess
 		},
 
 		DeleteFunc: func(e event.DeleteEvent) bool {
@@ -164,7 +188,7 @@ func shouldProcessNodeCreate(node *corev1.Node, monitoredLabels, monitoredAnnota
 }
 
 func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := ctrl.Log.WithName("reconcile").WithValues("node", req.NamespacedName)
+	logger := r.Logger.WithValues("node", req.NamespacedName)
 
 	var node corev1.Node
 	if err := r.Get(ctx, req.NamespacedName, &node); err != nil {
@@ -180,24 +204,31 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Create a map for tags to sync with the cloud provider
 	tagsToSync := make(map[string]string)
+	var notFoundLabels, notFoundAnnotations []string
 
 	// First collect labels (may be overwritten by annotations with same key)
-	if node.Labels != nil {
-		for _, k := range r.Labels {
-			if value, exists := node.Labels[k]; exists {
-				tagsToSync[k] = value
-			}
+	for _, k := range r.Labels {
+		if value, exists := node.Labels[k]; exists {
+			tagsToSync[k] = value
+		} else {
+			notFoundLabels = append(notFoundLabels, k)
 		}
 	}
 
 	// Then collect annotations (will overwrite labels with same key)
-	if node.Annotations != nil {
-		for _, k := range r.Annotations {
-			if value, exists := node.Annotations[k]; exists {
-				tagsToSync[k] = value
-			}
+	for _, k := range r.Annotations {
+		if value, exists := node.Annotations[k]; exists {
+			tagsToSync[k] = value
+		} else {
+			notFoundAnnotations = append(notFoundAnnotations, k)
 		}
 	}
+
+	logger.V(1).Info("Collected tags to sync",
+		"tagsToSync", tagsToSync,
+		"notFoundLabels", notFoundLabels,
+		"notFoundAnnotations", notFoundAnnotations,
+	)
 
 	var err error
 	switch r.Cloud {
@@ -208,11 +239,11 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	if err != nil {
-		logger.Error(err, "failed to sync tags")
+		logger.Error(err, "failed to sync tags", "providerID", providerID)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully synced tags to cloud provider", "tags", tagsToSync)
+	logger.Info("Successfully synced tags to cloud provider", "providerID", providerID, "tags", tagsToSync)
 	return ctrl.Result{}, nil
 }
 

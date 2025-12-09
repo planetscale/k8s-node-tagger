@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gce "google.golang.org/api/compute/v1"
@@ -184,6 +185,7 @@ func TestReconcileAWS(t *testing.T) {
 
 			r := &NodeLabelController{
 				Client:      k8s,
+				Logger:      logr.Discard(),
 				Labels:      tt.labelsToCopy,
 				Annotations: tt.annotationsToCopy,
 				Cloud:       "aws",
@@ -315,6 +317,7 @@ func TestReconcileGCP(t *testing.T) {
 
 			r := &NodeLabelController{
 				Client:      k8s,
+				Logger:      logr.Discard(),
 				Labels:      tt.labelsToCopy,
 				Annotations: tt.annotationsToCopy,
 				Cloud:       "gcp",
@@ -656,5 +659,186 @@ func createNode(config mockNode) *corev1.Node {
 		Spec: corev1.NodeSpec{
 			ProviderID: config.ProviderID,
 		},
+	}
+}
+
+// TestPredicateToReconcileFlow tests the full flow from event through predicate to reconcile.
+// This simulates what controller-runtime does: events are filtered by predicates, and only
+// if the predicate allows, reconcile is called.
+func TestPredicateToReconcileFlow(t *testing.T) {
+	tests := []struct {
+		name                    string
+		monitoredLabels         []string
+		initialNode             mockNode
+		updatedNode             *mockNode // nil means no update step
+		expectReconcileOnCreate bool
+		expectReconcileOnUpdate bool
+		expectTagsCreated       []string // tag keys we expect to be created
+	}{
+		{
+			name:            "node created without monitored labels then labels added",
+			monitoredLabels: []string{"env", "team"},
+			initialNode: mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{"kubernetes.io/hostname": "node1"},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			updatedNode: &mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{"kubernetes.io/hostname": "node1", "env": "prod", "team": "platform"},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			expectReconcileOnCreate: false, // no monitored labels yet
+			expectReconcileOnUpdate: true,  // monitored labels added
+			expectTagsCreated:       []string{"env", "team"},
+		},
+		{
+			name:            "node created with monitored labels already present",
+			monitoredLabels: []string{"env"},
+			initialNode: mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{"env": "prod"},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			updatedNode:             nil,
+			expectReconcileOnCreate: true,
+			expectReconcileOnUpdate: false,
+			expectTagsCreated:       []string{"env"},
+		},
+		{
+			name:            "node created without labels then only some monitored labels added",
+			monitoredLabels: []string{"env", "team", "region"},
+			initialNode: mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			updatedNode: &mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{"env": "prod"}, // only env, not team or region
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			expectReconcileOnCreate: false,
+			expectReconcileOnUpdate: true,
+			expectTagsCreated:       []string{"env"}, // only env should be synced
+		},
+		{
+			name:            "node update that does not change monitored labels triggers resync",
+			monitoredLabels: []string{"env"},
+			initialNode: mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{"env": "prod"},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			updatedNode: &mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{"env": "prod", "unrelated": "change"},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			expectReconcileOnCreate: true,
+			expectReconcileOnUpdate: true, // resync: node has monitored labels
+			expectTagsCreated:       []string{"env"},
+		},
+		{
+			name:            "multiple labels added in single update",
+			monitoredLabels: []string{"env", "team", "cost-center"},
+			initialNode: mockNode{
+				Name:       "node1",
+				Labels:     map[string]string{},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			updatedNode: &mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env":         "prod",
+					"team":        "platform",
+					"cost-center": "12345",
+				},
+				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+			},
+			expectReconcileOnCreate: false,
+			expectReconcileOnUpdate: true,
+			expectTagsCreated:       []string{"env", "team", "cost-center"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1.AddToScheme(scheme))
+
+			// Start with initial node in the fake client
+			k8s := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(createNode(tt.initialNode)).
+				Build()
+
+			mock := &mockEC2Client{currentTags: []types.TagDescription{}}
+
+			controller := &NodeLabelController{
+				Client:      k8s,
+				Logger:      logr.Discard(),
+				Labels:      tt.monitoredLabels,
+				Annotations: []string{},
+				Cloud:       "aws",
+				EC2Client:   mock,
+			}
+
+			// Simulate CREATE event
+			initialNodeObj := createNode(tt.initialNode)
+			createAllowed := shouldProcessNodeCreate(initialNodeObj, tt.monitoredLabels, []string{})
+
+			assert.Equal(t, tt.expectReconcileOnCreate, createAllowed,
+				"Create predicate returned unexpected result")
+
+			if createAllowed {
+				_, err := controller.Reconcile(context.Background(), ctrl.Request{
+					NamespacedName: client.ObjectKey{Name: tt.initialNode.Name},
+				})
+				require.NoError(t, err)
+
+				// Verify tags were created
+				createdKeys := make([]string, 0, len(mock.createdTags))
+				for _, tag := range mock.createdTags {
+					createdKeys = append(createdKeys, aws.ToString(tag.Key))
+				}
+				assert.ElementsMatch(t, tt.expectTagsCreated, createdKeys,
+					"Created tags don't match expected")
+			}
+
+			// Simulate UPDATE event if provided
+			if tt.updatedNode != nil {
+				// Reset mock for update test
+				mock.createdTags = nil
+				mock.currentTags = []types.TagDescription{} // EC2 has no tags yet (simulating missed create)
+
+				// Update the node in the fake client
+				updatedNodeObj := createNode(*tt.updatedNode)
+				err := k8s.Update(context.Background(), updatedNodeObj)
+				require.NoError(t, err)
+
+				// Match the actual predicate logic: allow if labels changed OR if node has monitored labels (resync)
+				updateAllowed := shouldProcessNodeUpdate(initialNodeObj, updatedNodeObj, tt.monitoredLabels, []string{}) ||
+					shouldProcessNodeCreate(updatedNodeObj, tt.monitoredLabels, []string{})
+
+				assert.Equal(t, tt.expectReconcileOnUpdate, updateAllowed,
+					"Update predicate returned unexpected result")
+
+				if updateAllowed {
+					_, err := controller.Reconcile(context.Background(), ctrl.Request{
+						NamespacedName: client.ObjectKey{Name: tt.updatedNode.Name},
+					})
+					require.NoError(t, err)
+
+					// Verify tags were created
+					createdKeys := make([]string, 0, len(mock.createdTags))
+					for _, tag := range mock.createdTags {
+						createdKeys = append(createdKeys, aws.ToString(tag.Key))
+					}
+					assert.ElementsMatch(t, tt.expectTagsCreated, createdKeys,
+						"Created tags on update don't match expected")
+				}
+			}
+		})
 	}
 }
