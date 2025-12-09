@@ -6,16 +6,22 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
-const leaderElectionId = "node-label-controller"
+const (
+	leaderElectionID = "node-label-controller"
+	cacheSyncPeriod  = 4 * time.Hour
+)
 
 func main() {
 	var probesAddr string
@@ -25,9 +31,6 @@ func main() {
 	var labelsStr string
 	var annotationsStr string
 	var cloudProvider string
-	var jsonLogs bool
-
-	logger := ctrl.Log.WithName("main")
 
 	flag.StringVar(&probesAddr, "probes-addr", ":8080", "The address the /readyz and /healthz probes endpoint binds to.")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8081", "The address the metric endpoint binds to.")
@@ -36,29 +39,28 @@ func main() {
 	flag.StringVar(&labelsStr, "labels", "", "Comma-separated list of label keys to sync")
 	flag.StringVar(&annotationsStr, "annotations", "", "Comma-separated list of annotation keys to sync")
 	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws or gcp)")
-	flag.BoolVar(&jsonLogs, "json", false, "Output logs in JSON format")
+
+	// Add zap logger flags (--zap-log-level, --zap-stacktrace-level, --zap-encoder, --zap-devel)
+	zapOpts := zap.Options{}
+	zapOpts.BindFlags(flag.CommandLine)
+
 	flag.Parse()
 
-	// setup logger. Use development mode by default or json output if --json is set
-	var opts []zap.Opts
-	opts = append(opts, zap.UseDevMode(!jsonLogs))
-	if jsonLogs {
-		opts = append(opts, zap.JSONEncoder())
-	}
-	ctrl.SetLogger(zap.New(opts...))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
+	logger := ctrl.Log.WithName("main")
 
 	// validate flags
 	if labelsStr == "" && annotationsStr == "" {
 		logger.Error(fmt.Errorf("either --labels or --annotations is required"), "unable to start manager")
 		os.Exit(1)
 	}
-	
+
 	var labels []string
 	if labelsStr != "" {
 		labels = strings.Split(labelsStr, ",")
 		logger.Info("Label keys to sync", "labelKeys", labels)
 	}
-	
+
 	var annotations []string
 	if annotationsStr != "" {
 		annotations = strings.Split(annotationsStr, ",")
@@ -89,7 +91,10 @@ func main() {
 		},
 		PprofBindAddress: pprofAddr,
 		LeaderElection:   enableLeaderElection,
-		LeaderElectionID: leaderElectionId,
+		LeaderElectionID: leaderElectionID,
+		Cache: cache.Options{
+			SyncPeriod: ptr.To(cacheSyncPeriod),
+		},
 	})
 	if err != nil {
 		logger.Error(err, "unable to start manager")
@@ -111,6 +116,7 @@ func main() {
 	// setup our controller and start it
 	controller := &NodeLabelController{
 		Client:      mgr.GetClient(),
+		Logger:      ctrl.Log.WithName("controller"),
 		Labels:      labels,
 		Annotations: annotations,
 		Cloud:       cloudProvider,
