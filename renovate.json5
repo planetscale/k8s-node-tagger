@@ -3,7 +3,7 @@
   "extends": [
     "github>planetscale/renovate-config",
     "github>planetscale/renovate-config:kubernetes",
-    "github>planetscale/renovate-config:weeklyBatchMinorPatchDigest"
+    "github>planetscale/renovate-config:monthlyBatchMinorPatchDigest"
   ],
   "packageRules": [
     {
