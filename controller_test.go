@@ -57,10 +57,11 @@ func (m *mockGCEClient) SetLabels(ctx context.Context, project, zone, instance s
 }
 
 type mockNode struct {
-	Name        string
-	Labels      map[string]string
-	Annotations map[string]string
-	ProviderID  string
+	Name            string
+	Labels          map[string]string
+	Annotations     map[string]string
+	ProviderID      string
+	ResourceVersion string
 }
 
 func TestReconcileAWS(t *testing.T) {
@@ -652,14 +653,31 @@ func TestSanitizeKeysForGCP(t *testing.T) {
 func createNode(config mockNode) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        config.Name,
-			Labels:      config.Labels,
-			Annotations: config.Annotations,
+			Name:            config.Name,
+			Labels:          config.Labels,
+			Annotations:     config.Annotations,
+			ResourceVersion: config.ResourceVersion,
 		},
 		Spec: corev1.NodeSpec{
 			ProviderID: config.ProviderID,
 		},
 	}
+}
+
+// simulateUpdatePredicate matches the actual predicate logic in SetupWithManager.
+// Returns true if the update event should trigger reconciliation.
+func simulateUpdatePredicate(oldNode, newNode *corev1.Node, monitoredLabels, monitoredAnnotations []string) bool {
+	// Process if any monitored label/annotation changed
+	if shouldProcessNodeUpdate(oldNode, newNode, monitoredLabels, monitoredAnnotations) {
+		return true
+	}
+
+	// During periodic resync (same ResourceVersion), allow if node has monitored labels
+	if oldNode.ResourceVersion == newNode.ResourceVersion {
+		return shouldProcessNodeCreate(newNode, monitoredLabels, monitoredAnnotations)
+	}
+
+	return false
 }
 
 // TestPredicateToReconcileFlow tests the full flow from event through predicate to reconcile.
@@ -723,20 +741,41 @@ func TestPredicateToReconcileFlow(t *testing.T) {
 			expectTagsCreated:       []string{"env"}, // only env should be synced
 		},
 		{
-			name:            "node update that does not change monitored labels triggers resync",
+			name:            "periodic resync with same ResourceVersion triggers reconcile",
 			monitoredLabels: []string{"env"},
 			initialNode: mockNode{
-				Name:       "node1",
-				Labels:     map[string]string{"env": "prod"},
-				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+				Name:            "node1",
+				Labels:          map[string]string{"env": "prod"},
+				ProviderID:      "aws:///us-east-1a/i-1234567890abcdef0",
+				ResourceVersion: "12345",
 			},
 			updatedNode: &mockNode{
-				Name:       "node1",
-				Labels:     map[string]string{"env": "prod", "unrelated": "change"},
-				ProviderID: "aws:///us-east-1a/i-1234567890abcdef0",
+				Name:            "node1",
+				Labels:          map[string]string{"env": "prod"}, // same labels
+				ProviderID:      "aws:///us-east-1a/i-1234567890abcdef0",
+				ResourceVersion: "12345", // same ResourceVersion = true resync
 			},
 			expectReconcileOnCreate: true,
-			expectReconcileOnUpdate: true, // resync: node has monitored labels
+			expectReconcileOnUpdate: true, // true resync: same ResourceVersion
+			expectTagsCreated:       []string{"env"},
+		},
+		{
+			name:            "heartbeat update with different ResourceVersion does not trigger reconcile",
+			monitoredLabels: []string{"env"},
+			initialNode: mockNode{
+				Name:            "node1",
+				Labels:          map[string]string{"env": "prod"},
+				ProviderID:      "aws:///us-east-1a/i-1234567890abcdef0",
+				ResourceVersion: "12345",
+			},
+			updatedNode: &mockNode{
+				Name:            "node1",
+				Labels:          map[string]string{"env": "prod"}, // same labels
+				ProviderID:      "aws:///us-east-1a/i-1234567890abcdef0",
+				ResourceVersion: "12346", // different ResourceVersion = real update, not resync
+			},
+			expectReconcileOnCreate: true,
+			expectReconcileOnUpdate: false, // NOT a resync, just heartbeat - skip
 			expectTagsCreated:       []string{"env"},
 		},
 		{
@@ -812,20 +851,25 @@ func TestPredicateToReconcileFlow(t *testing.T) {
 				mock.createdTags = nil
 				mock.currentTags = []types.TagDescription{} // EC2 has no tags yet (simulating missed create)
 
-				// Update the node in the fake client
+				// Create the updated node object directly (not through fake client)
+				// to test predicate logic with explicit ResourceVersions
 				updatedNodeObj := createNode(*tt.updatedNode)
-				err := k8s.Update(context.Background(), updatedNodeObj)
-				require.NoError(t, err)
 
-				// Match the actual predicate logic: allow if labels changed OR if node has monitored labels (resync)
-				updateAllowed := shouldProcessNodeUpdate(initialNodeObj, updatedNodeObj, tt.monitoredLabels, []string{}) ||
-					shouldProcessNodeCreate(updatedNodeObj, tt.monitoredLabels, []string{})
+				// Use the helper that matches actual predicate logic
+				updateAllowed := simulateUpdatePredicate(initialNodeObj, updatedNodeObj, tt.monitoredLabels, []string{})
 
 				assert.Equal(t, tt.expectReconcileOnUpdate, updateAllowed,
 					"Update predicate returned unexpected result")
 
 				if updateAllowed {
-					_, err := controller.Reconcile(context.Background(), ctrl.Request{
+					// For reconcile test, update the node in the fake client
+					// (without explicit ResourceVersion to avoid conflicts)
+					nodeForClient := createNode(*tt.updatedNode)
+					nodeForClient.ResourceVersion = "" // let fake client manage this
+					err := k8s.Update(context.Background(), nodeForClient)
+					require.NoError(t, err)
+
+					_, err = controller.Reconcile(context.Background(), ctrl.Request{
 						NamespacedName: client.ObjectKey{Name: tt.updatedNode.Name},
 					})
 					require.NoError(t, err)
