@@ -76,12 +76,16 @@ func (r *NodeLabelController) SetupWithManager(mgr ctrl.Manager) error {
 				return true
 			}
 
-			// Also process if node has monitored labels (catches resync events).
-			// During resync, old == new, so shouldProcessNodeUpdate returns false,
-			// but we still want to reconcile to catch any missed events.
-			if shouldProcessNodeCreate(newNode, r.Labels, r.Annotations) {
-				r.Logger.V(1).Info("Update event: resync", "node", newNode.Name)
-				return true
+			// During periodic resync, controller-runtime emits Update events where
+			// oldObj and newObj are identical (same ResourceVersion). Allow these
+			// through for nodes with monitored labels to catch any missed events.
+			// But filter out real updates (different ResourceVersion) where only
+			// non-label fields changed (e.g., heartbeat, status updates).
+			if oldNode.ResourceVersion == newNode.ResourceVersion {
+				if shouldProcessNodeCreate(newNode, r.Labels, r.Annotations) {
+					r.Logger.V(1).Info("Update event: periodic resync", "node", newNode.Name)
+					return true
+				}
 			}
 
 			return false
