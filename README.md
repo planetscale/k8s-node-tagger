@@ -8,7 +8,7 @@ See the [./examples](./examples) directory for example manifests. These are just
 
 ## Command-line Flags
 
-- `-cloud`: Cloud provider to use (`aws` or `gcp`). Required.
+- `-cloud`: Cloud provider to use (`aws`, `gcp`, or `azure`). Required.
 - `-labels`: Comma-separated list of node label keys to sync to cloud provider tags.
 - `-annotations`: Comma-separated list of node annotation keys to sync to cloud provider tags.
 - `-json`: Output logs in JSON format.

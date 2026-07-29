@@ -22,9 +22,10 @@ import (
 
 type NodeLabelController struct {
 	client.Client
-	Logger    logr.Logger
-	EC2Client ec2Client
-	GCEClient gceClient
+	Logger            logr.Logger
+	EC2Client         ec2Client
+	GCEClient         gceClient
+	AzureComputeClient azureComputeClient
 
 	// Labels is a list of label keys to sync from the node to the cloud provider
 	Labels []string
@@ -32,7 +33,7 @@ type NodeLabelController struct {
 	// Annotations is a list of annotation keys to sync from the node to the cloud provider
 	Annotations []string
 
-	// Cloud is the cloud provider (aws or gcp)
+	// Cloud is the cloud provider (aws, gcp, or azure)
 	Cloud string
 }
 
@@ -50,6 +51,12 @@ func (r *NodeLabelController) SetupCloudProvider(ctx context.Context) error {
 			return fmt.Errorf("unable to create GCP client: %v", err)
 		}
 		r.GCEClient = newGCEComputeClient(c)
+	case "azure":
+		// TODO: construct the real Azure compute client here once the SDK
+		// package (armcompute vs. instance metadata service) is chosen. The
+		// stub makes the azure provider selectable end-to-end but is not
+		// functional.
+		r.AzureComputeClient = newAzureComputeClient()
 	default:
 		return fmt.Errorf("unsupported cloud provider: %q", r.Cloud)
 	}
@@ -240,6 +247,8 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 		err = r.syncAWSTags(ctx, providerID, tagsToSync)
 	case "gcp":
 		err = r.syncGCPLabels(ctx, providerID, tagsToSync)
+	case "azure":
+		err = r.syncAzureTags(ctx, providerID, tagsToSync)
 	}
 
 	if err != nil {
@@ -430,4 +439,71 @@ func sanitizeValueForGCP(value string) string {
 		value = value[:63]
 	}
 	return value
+}
+
+// syncAzureTags syncs the desired tags to the Azure VM backing the node.
+//
+// TODO: implement this once the Azure compute client is wired up. It should
+// mirror syncAWSTags/syncGCPLabels: parse the provider ID, fetch current tags,
+// compute the diff against the monitored label/annotation keys, and apply the
+// resulting add/delete set via the Azure compute API.
+func (r *NodeLabelController) syncAzureTags(ctx context.Context, providerID string, desiredTags map[string]string) error {
+	subscriptionID, resourceGroup, vmName, err := parseAzureProviderID(providerID)
+	if err != nil {
+		return fmt.Errorf("failed to parse Azure provider ID: %v", err)
+	}
+
+	currentTags, err := r.AzureComputeClient.GetInstanceTags(ctx, subscriptionID, resourceGroup, vmName)
+	if err != nil {
+		return fmt.Errorf("failed to fetch node's current Azure tags: %v", err)
+	}
+
+	// Create a set of all monitored keys (both labels and annotations)
+	monitoredKeys := make(map[string]bool)
+	for _, k := range r.Labels {
+		monitoredKeys[k] = true
+	}
+	for _, k := range r.Annotations {
+		monitoredKeys[k] = true
+	}
+
+	// Determine whether an update is needed before calling SetInstanceTags.
+	needsUpdate := false
+	for k, v := range desiredTags {
+		if curr, exists := currentTags[k]; !exists || curr != v {
+			needsUpdate = true
+			break
+		}
+	}
+	if !needsUpdate {
+		for k := range currentTags {
+			if monitoredKeys[k] {
+				if _, exists := desiredTags[k]; !exists {
+					needsUpdate = true
+					break
+				}
+			}
+		}
+	}
+
+	if !needsUpdate {
+		return nil
+	}
+
+	// Build the full desired tag set (existing unmonitored tags + monitored
+	// desired tags) so SetInstanceTags can replace the VM's tag set in one call.
+	merged := make(map[string]string, len(currentTags)+len(desiredTags))
+	for k, v := range currentTags {
+		if !monitoredKeys[k] {
+			merged[k] = v
+		}
+	}
+	for k, v := range desiredTags {
+		merged[k] = v
+	}
+
+	if err := r.AzureComputeClient.SetInstanceTags(ctx, subscriptionID, resourceGroup, vmName, merged); err != nil {
+		return fmt.Errorf("failed to update Azure VM tags: %v", err)
+	}
+	return nil
 }
