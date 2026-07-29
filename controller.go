@@ -22,9 +22,9 @@ import (
 
 type NodeLabelController struct {
 	client.Client
-	Logger            logr.Logger
-	EC2Client         ec2Client
-	GCEClient         gceClient
+	Logger             logr.Logger
+	EC2Client          ec2Client
+	GCEClient          gceClient
 	AzureComputeClient azureComputeClient
 
 	// Labels is a list of label keys to sync from the node to the cloud provider
@@ -52,11 +52,11 @@ func (r *NodeLabelController) SetupCloudProvider(ctx context.Context) error {
 		}
 		r.GCEClient = newGCEComputeClient(c)
 	case "azure":
-		// TODO: construct the real Azure compute client here once the SDK
-		// package (armcompute vs. instance metadata service) is chosen. The
-		// stub makes the azure provider selectable end-to-end but is not
-		// functional.
-		r.AzureComputeClient = newAzureComputeClient()
+		c, err := newAzureComputeClient(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to create Azure compute client: %v", err)
+		}
+		r.AzureComputeClient = c
 	default:
 		return fmt.Errorf("unsupported cloud provider: %q", r.Cloud)
 	}
@@ -441,68 +441,56 @@ func sanitizeValueForGCP(value string) string {
 	return value
 }
 
-// syncAzureTags syncs the desired tags to the Azure VM backing the node.
-//
-// TODO: implement this once the Azure compute client is wired up. It should
-// mirror syncAWSTags/syncGCPLabels: parse the provider ID, fetch current tags,
-// compute the diff against the monitored label/annotation keys, and apply the
-// resulting add/delete set via the Azure compute API.
+// syncAzureTags syncs the desired tags to the Azure VM (or VMSS VM instance)
+// backing the node. It mirrors syncAWSTags/syncGCPLabels: parse the provider
+// ID, fetch the current tags, compute the diff against the monitored
+// label/annotation keys, and replace the VM's tag set in one call. Azure tag
+// keys disallow several characters that Kubernetes label keys commonly use
+// (notably "/"), so monitored keys are sanitized; unmanaged tags are preserved
+// verbatim.
 func (r *NodeLabelController) syncAzureTags(ctx context.Context, providerID string, desiredTags map[string]string) error {
-	subscriptionID, resourceGroup, vmName, err := parseAzureProviderID(providerID)
+	res, err := parseAzureProviderID(providerID)
 	if err != nil {
 		return fmt.Errorf("failed to parse Azure provider ID: %v", err)
 	}
 
-	currentTags, err := r.AzureComputeClient.GetInstanceTags(ctx, subscriptionID, resourceGroup, vmName)
+	currentTags, err := r.AzureComputeClient.GetInstanceTags(ctx, res)
 	if err != nil {
 		return fmt.Errorf("failed to fetch node's current Azure tags: %v", err)
 	}
 
-	// Create a set of all monitored keys (both labels and annotations)
-	monitoredKeys := make(map[string]bool)
-	for _, k := range r.Labels {
-		monitoredKeys[k] = true
-	}
-	for _, k := range r.Annotations {
-		monitoredKeys[k] = true
+	// Create a set of all monitored keys (both labels and annotations), mapped
+	// from their sanitized form back to the original key.
+	allMonitoredKeys := make([]string, 0, len(r.Labels)+len(r.Annotations))
+	allMonitoredKeys = append(allMonitoredKeys, r.Labels...)
+	allMonitoredKeys = append(allMonitoredKeys, r.Annotations...)
+
+	monitoredKeys := make(map[string]string) // sanitized -> original
+	for _, k := range allMonitoredKeys {
+		monitoredKeys[sanitizeKeyForAzure(k)] = k
 	}
 
-	// Determine whether an update is needed before calling SetInstanceTags.
-	needsUpdate := false
+	// Start from the current tags so unmanaged tags are preserved, then drop
+	// monitored tags that are no longer desired and add/update desired ones.
+	merged := make(map[string]string, len(currentTags)+len(desiredTags))
+	for k, v := range currentTags {
+		merged[k] = v
+	}
+	for sanKey, orig := range monitoredKeys {
+		if _, exists := desiredTags[orig]; !exists {
+			delete(merged, sanKey)
+		}
+	}
 	for k, v := range desiredTags {
-		if curr, exists := currentTags[k]; !exists || curr != v {
-			needsUpdate = true
-			break
-		}
-	}
-	if !needsUpdate {
-		for k := range currentTags {
-			if monitoredKeys[k] {
-				if _, exists := desiredTags[k]; !exists {
-					needsUpdate = true
-					break
-				}
-			}
-		}
+		merged[sanitizeKeyForAzure(k)] = sanitizeValueForAzure(v)
 	}
 
-	if !needsUpdate {
+	// Skip the round-trip if nothing changed.
+	if maps.Equal(currentTags, merged) {
 		return nil
 	}
 
-	// Build the full desired tag set (existing unmonitored tags + monitored
-	// desired tags) so SetInstanceTags can replace the VM's tag set in one call.
-	merged := make(map[string]string, len(currentTags)+len(desiredTags))
-	for k, v := range currentTags {
-		if !monitoredKeys[k] {
-			merged[k] = v
-		}
-	}
-	for k, v := range desiredTags {
-		merged[k] = v
-	}
-
-	if err := r.AzureComputeClient.SetInstanceTags(ctx, subscriptionID, resourceGroup, vmName, merged); err != nil {
+	if err := r.AzureComputeClient.SetInstanceTags(ctx, res, merged); err != nil {
 		return fmt.Errorf("failed to update Azure VM tags: %v", err)
 	}
 	return nil

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"testing"
 
@@ -53,6 +54,24 @@ func (m *mockGCEClient) GetInstance(ctx context.Context, project, zone, instance
 
 func (m *mockGCEClient) SetLabels(ctx context.Context, project, zone, instance string, req *gce.InstancesSetLabelsRequest) error {
 	m.labels = req.Labels
+	return nil
+}
+
+// mockAzureClient is a mock implementation of azureComputeClient for testing.
+// It records the last tag set applied via SetInstanceTags and returns it from
+// the next GetInstanceTags, modelling a tag-replace API.
+type mockAzureClient struct {
+	tags map[string]string
+	last azureVMResource
+}
+
+func (m *mockAzureClient) GetInstanceTags(ctx context.Context, res azureVMResource) (map[string]string, error) {
+	return maps.Clone(m.tags), nil
+}
+
+func (m *mockAzureClient) SetInstanceTags(ctx context.Context, res azureVMResource, desiredTags map[string]string) error {
+	m.last = res
+	m.tags = maps.Clone(desiredTags)
 	return nil
 }
 
@@ -333,6 +352,287 @@ func TestReconcileGCP(t *testing.T) {
 			assert.Equal(t, tt.wantLabels, mock.labels)
 		})
 	}
+}
+
+func TestReconcileAzure(t *testing.T) {
+	tests := []struct {
+		name              string
+		labelsToCopy      []string
+		annotationsToCopy []string
+		node              mockNode
+		currentTags       map[string]string
+		wantTags          map[string]string
+	}{
+		{
+			name:              "sync tags from --annotations (vmss instance)",
+			annotationsToCopy: []string{"region", "instance-type"},
+			node: mockNode{
+				Name: "node1",
+				Annotations: map[string]string{
+					"region":        "eastus",
+					"instance-type": "Standard_D2s_v5",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/0",
+			},
+			currentTags: map[string]string{},
+			wantTags: map[string]string{
+				"region":        "eastus",
+				"instance-type": "Standard_D2s_v5",
+			},
+		},
+		{
+			name:         "sync tags from --labels (standalone vm)",
+			labelsToCopy: []string{"region", "instance-type"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"region":        "eastus",
+					"instance-type": "Standard_D2s_v5",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			},
+			currentTags: map[string]string{},
+			wantTags: map[string]string{
+				"region":        "eastus",
+				"instance-type": "Standard_D2s_v5",
+			},
+		},
+		{
+			name:         "slash in label key is sanitized for azure",
+			labelsToCopy: []string{"kubernetes.io/hostname", "node-role.kubernetes.io/worker"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"kubernetes.io/hostname":         "node1",
+					"node-role.kubernetes.io/worker": "true",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			},
+			currentTags: map[string]string{},
+			wantTags: map[string]string{
+				"kubernetes.io_hostname":         "node1",
+				"node-role.kubernetes.io_worker": "true",
+			},
+		},
+		{
+			name:         "add new tag from labels",
+			labelsToCopy: []string{"env", "team"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env":  "prod",
+					"team": "platform",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/1",
+			},
+			currentTags: map[string]string{
+				"env": "staging",
+			},
+			wantTags: map[string]string{
+				"env":  "prod",
+				"team": "platform",
+			},
+		},
+		{
+			name:         "remove tag",
+			labelsToCopy: []string{"env"},
+			node: mockNode{
+				Name:       "node1",
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			},
+			currentTags: map[string]string{
+				"env": "prod",
+			},
+			wantTags: map[string]string{},
+		},
+		{
+			name:         "preserve unmanaged tags",
+			labelsToCopy: []string{"env"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env": "prod",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			},
+			currentTags: map[string]string{
+				"env":         "staging",
+				"cost-center": "12345",
+			},
+			wantTags: map[string]string{
+				"env":         "prod",
+				"cost-center": "12345",
+			},
+		},
+		{
+			name:         "no-op when tags already match",
+			labelsToCopy: []string{"env"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env": "prod",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			},
+			currentTags: map[string]string{
+				"env":         "prod",
+				"cost-center": "12345",
+			},
+			wantTags: map[string]string{
+				"env":         "prod",
+				"cost-center": "12345",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, corev1.AddToScheme(scheme))
+
+			k8s := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(createNode(tt.node)).
+				Build()
+
+			mock := &mockAzureClient{tags: tt.currentTags}
+
+			r := &NodeLabelController{
+				Client:             k8s,
+				Logger:             logr.Discard(),
+				Labels:             tt.labelsToCopy,
+				Annotations:        tt.annotationsToCopy,
+				Cloud:              "azure",
+				AzureComputeClient: mock,
+			}
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: client.ObjectKey{Name: tt.node.Name},
+			})
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantTags, mock.tags)
+		})
+	}
+}
+
+func TestParseAzureProviderID(t *testing.T) {
+	tests := []struct {
+		name       string
+		providerID string
+		wantRes    azureVMResource
+		wantErr    bool
+	}{
+		{
+			name:       "standalone vm",
+			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			wantRes: azureVMResource{
+				SubscriptionID: "sub-123",
+				ResourceGroup:  "mc-rg",
+				Provider:       "virtualMachines",
+				VMName:         "aks-node-1",
+			},
+		},
+		{
+			name:       "vmss instance",
+			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/0",
+			wantRes: azureVMResource{
+				SubscriptionID: "sub-123",
+				ResourceGroup:  "mc-rg",
+				Provider:       "virtualMachineScaleSets",
+				VMSSName:       "aks-pool",
+				InstanceID:     "0",
+			},
+		},
+		{
+			name:       "two-slash prefix",
+			providerID: "azure://subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			wantRes: azureVMResource{
+				SubscriptionID: "sub-123",
+				ResourceGroup:  "mc-rg",
+				Provider:       "virtualMachines",
+				VMName:         "aks-node-1",
+			},
+		},
+		{
+			name:       "missing azure prefix",
+			providerID: "invalid:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
+			wantErr:    true,
+		},
+		{
+			name:       "empty provider ID",
+			providerID: "",
+			wantErr:    true,
+		},
+		{
+			name:       "truncated vmss path",
+			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool",
+			wantErr:    true,
+		},
+		{
+			name:       "unsupported provider type",
+			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/disks/disk-1",
+			wantErr:    true,
+		},
+		{
+			name:       "wrong resource namespace",
+			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Network/virtualMachines/aks-node-1",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseAzureProviderID(tt.providerID)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantRes, got)
+		})
+	}
+}
+
+func TestSanitizeKeyForAzure(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{
+			name: "slash replaced",
+			key:  "kubernetes.io/hostname",
+			want: "kubernetes.io_hostname",
+		},
+		{
+			name: "multiple disallowed chars",
+			key:  "a/b<c>d%e&f\\g?h",
+			want: "a_b_c_d_e_f_g_h",
+		},
+		{
+			name: "no special chars unchanged",
+			key:  "env",
+			want: "env",
+		},
+		{
+			name: "truncated to 512",
+			key:  strings.Repeat("a", 600),
+			want: strings.Repeat("a", 512),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, sanitizeKeyForAzure(tt.key))
+		})
+	}
+}
+
+func TestSanitizeValueForAzure(t *testing.T) {
+	assert.Equal(t, "a_b_c", sanitizeValueForAzure("a<b>c"))
+	assert.Equal(t, strings.Repeat("a", 256), sanitizeValueForAzure(strings.Repeat("a", 300)))
 }
 
 func TestShouldProcessNodeUpdate(t *testing.T) {
