@@ -38,7 +38,7 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false, "Enable leader election.")
 	flag.StringVar(&labelsStr, "labels", "", "Comma-separated list of label keys to sync")
 	flag.StringVar(&annotationsStr, "annotations", "", "Comma-separated list of annotation keys to sync")
-	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws or gcp)")
+	flag.StringVar(&cloudProvider, "cloud", "", "Cloud provider (aws, gcp, or azure)")
 
 	// Add zap logger flags (--zap-log-level, --zap-stacktrace-level, --zap-encoder, --zap-devel)
 	zapOpts := zap.Options{}
@@ -67,8 +67,8 @@ func main() {
 		logger.Info("Annotation keys to sync", "annotationKeys", annotations)
 	}
 
-	if cloudProvider != "aws" && cloudProvider != "gcp" {
-		logger.Error(fmt.Errorf("cloud-provider must be either 'aws' or 'gcp'"), "unable to start manager")
+	if cloudProvider != "aws" && cloudProvider != "gcp" && cloudProvider != "azure" {
+		logger.Error(fmt.Errorf("cloud-provider must be 'aws', 'gcp', or 'azure'"), "unable to start manager")
 		os.Exit(1)
 	}
 

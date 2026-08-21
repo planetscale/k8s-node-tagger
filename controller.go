@@ -22,9 +22,10 @@ import (
 
 type NodeLabelController struct {
 	client.Client
-	Logger    logr.Logger
-	EC2Client ec2Client
-	GCEClient gceClient
+	Logger             logr.Logger
+	EC2Client          ec2Client
+	GCEClient          gceClient
+	AzureComputeClient azureComputeClient
 
 	// Labels is a list of label keys to sync from the node to the cloud provider
 	Labels []string
@@ -32,7 +33,7 @@ type NodeLabelController struct {
 	// Annotations is a list of annotation keys to sync from the node to the cloud provider
 	Annotations []string
 
-	// Cloud is the cloud provider (aws or gcp)
+	// Cloud is the cloud provider (aws, gcp, or azure)
 	Cloud string
 }
 
@@ -50,6 +51,12 @@ func (r *NodeLabelController) SetupCloudProvider(ctx context.Context) error {
 			return fmt.Errorf("unable to create GCP client: %v", err)
 		}
 		r.GCEClient = newGCEComputeClient(c)
+	case "azure":
+		c, err := newAzureComputeClient(ctx)
+		if err != nil {
+			return fmt.Errorf("unable to create Azure compute client: %v", err)
+		}
+		r.AzureComputeClient = c
 	default:
 		return fmt.Errorf("unsupported cloud provider: %q", r.Cloud)
 	}
@@ -240,6 +247,8 @@ func (r *NodeLabelController) Reconcile(ctx context.Context, req ctrl.Request) (
 		err = r.syncAWSTags(ctx, providerID, tagsToSync)
 	case "gcp":
 		err = r.syncGCPLabels(ctx, providerID, tagsToSync)
+	case "azure":
+		err = r.syncAzureTags(ctx, providerID, tagsToSync)
 	}
 
 	if err != nil {
@@ -430,4 +439,59 @@ func sanitizeValueForGCP(value string) string {
 		value = value[:63]
 	}
 	return value
+}
+
+// syncAzureTags syncs the desired tags to the Azure VM (or VMSS VM instance)
+// backing the node. It mirrors syncAWSTags/syncGCPLabels: parse the provider
+// ID, fetch the current tags, compute the diff against the monitored
+// label/annotation keys, and replace the VM's tag set in one call. Azure tag
+// keys disallow several characters that Kubernetes label keys commonly use
+// (notably "/"), so monitored keys are sanitized; unmanaged tags are preserved
+// verbatim.
+func (r *NodeLabelController) syncAzureTags(ctx context.Context, providerID string, desiredTags map[string]string) error {
+	res, err := parseAzureProviderID(providerID)
+	if err != nil {
+		return fmt.Errorf("failed to parse Azure provider ID: %v", err)
+	}
+
+	currentTags, err := r.AzureComputeClient.GetInstanceTags(ctx, res)
+	if err != nil {
+		return fmt.Errorf("failed to fetch node's current Azure tags: %v", err)
+	}
+
+	// Create a set of all monitored keys (both labels and annotations), mapped
+	// from their sanitized form back to the original key.
+	allMonitoredKeys := make([]string, 0, len(r.Labels)+len(r.Annotations))
+	allMonitoredKeys = append(allMonitoredKeys, r.Labels...)
+	allMonitoredKeys = append(allMonitoredKeys, r.Annotations...)
+
+	monitoredKeys := make(map[string]string) // sanitized -> original
+	for _, k := range allMonitoredKeys {
+		monitoredKeys[sanitizeKeyForAzure(k)] = k
+	}
+
+	// Start from the current tags so unmanaged tags are preserved, then drop
+	// monitored tags that are no longer desired and add/update desired ones.
+	merged := make(map[string]string, len(currentTags)+len(desiredTags))
+	for k, v := range currentTags {
+		merged[k] = v
+	}
+	for sanKey, orig := range monitoredKeys {
+		if _, exists := desiredTags[orig]; !exists {
+			delete(merged, sanKey)
+		}
+	}
+	for k, v := range desiredTags {
+		merged[sanitizeKeyForAzure(k)] = sanitizeValueForAzure(v)
+	}
+
+	// Skip the round-trip if nothing changed.
+	if maps.Equal(currentTags, merged) {
+		return nil
+	}
+
+	if err := r.AzureComputeClient.SetInstanceTags(ctx, res, merged); err != nil {
+		return fmt.Errorf("failed to update Azure VM tags: %v", err)
+	}
+	return nil
 }
