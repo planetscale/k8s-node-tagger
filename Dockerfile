@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1.21@sha256:27f9262d43452075f3c410287a2c43f5ef1bf7ec2bb06e8c9eeb1b8d453087bc
-FROM --platform=$BUILDPLATFORM pscale.dev/wolfi-prod/go:1.25 AS builder
+# syntax=docker/dockerfile:1.28@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
+FROM --platform=$BUILDPLATFORM pscale.dev/wolfi-prod/go:1.27 AS builder
 WORKDIR /work
 
 RUN \
