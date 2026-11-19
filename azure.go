@@ -6,39 +6,33 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v8"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources/v4"
 )
 
-// azureVMResource identifies the Azure compute resource backing a Kubernetes
-// node, parsed from the node's spec.ProviderID. AKS nodes are either:
+// azureVMResource identifies the standalone Azure VM backing a Kubernetes
+// node, parsed from the node's spec.ProviderID:
 //
-//   - standalone VMs:
-//     azure:///subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachines/<vm>
-//   - Virtual Machine Scale Set instances (the AKS default for node pools):
-//     azure:///subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachineScaleSets/<vmss>/virtualMachines/<instance>
+//	azure:///subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachines/<vm>
 type azureVMResource struct {
 	SubscriptionID string
 	ResourceGroup  string
-	// Provider is "virtualMachines" or "virtualMachineScaleSets".
-	Provider string
-	// VMName is set for standalone VMs (Provider == "virtualMachines").
-	VMName string
-	// VMSSName is set for VMSS instances (Provider == "virtualMachineScaleSets").
-	VMSSName string
-	// InstanceID is the VMSS instance index (Provider == "virtualMachineScaleSets").
-	InstanceID string
+	VMName         string
 }
 
-func (r azureVMResource) isVMSS() bool { return r.Provider == "virtualMachineScaleSets" }
+// scope returns the VM's ARM resource ID in the form the Tags API expects.
+func (r azureVMResource) scope() string {
+	return fmt.Sprintf("subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachines/%s",
+		r.SubscriptionID, r.ResourceGroup, r.VMName)
+}
 
 // azureComputeClient is the minimum interface we need for reading and writing
-// Azure VM tags. The production implementation wraps the armcompute
-// VirtualMachinesClient and VirtualMachineScaleSetVMsClient; tests use a fake.
+// Azure VM tags. The production implementation wraps the armresources
+// TagsClient; tests use a fake.
 type azureComputeClient interface {
-	// GetInstanceTags returns the current tags on the Azure VM (or VMSS VM
-	// instance) identified by res.
+	// GetInstanceTags returns the current tags on the Azure VM identified by res.
 	GetInstanceTags(ctx context.Context, res azureVMResource) (map[string]string, error)
 	// SetInstanceTags replaces the resource's entire tag set with desiredTags.
 	// Callers are responsible for preserving any unmanaged tags by including
@@ -46,12 +40,13 @@ type azureComputeClient interface {
 	SetInstanceTags(ctx context.Context, res azureVMResource, desiredTags map[string]string) error
 }
 
-// azureComputeClientImpl is the production azureComputeClient. It holds the
-// Azure credential resolved at setup and lazily builds the per-subscription
-// armcompute clients, because the subscription ID is not known until a node's
-// provider ID is parsed in Reconcile.
+// azureComputeClientImpl is the production azureComputeClient. It uses the
+// Microsoft.Resources/tags API rather than a compute GET+PUT of the whole VM.
+// A VM PUT resends the VM's user-assigned identities, which makes ARM require
+// Microsoft.ManagedIdentity/userAssignedIdentities/assign/action; the Tags API
+// only needs Microsoft.Resources/tags/{read,write} (e.g. "Tag Contributor").
 type azureComputeClientImpl struct {
-	cred azcore.TokenCredential
+	tags *armresources.TagsClient
 }
 
 var _ azureComputeClient = (*azureComputeClientImpl)(nil)
@@ -71,80 +66,39 @@ func newAzureComputeClient(ctx context.Context) (azureComputeClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to load Azure credentials: %v", err)
 	}
-	return &azureComputeClientImpl{cred: cred}, nil
+	return newAzureTagsClient(cred, nil)
 }
 
-func (c *azureComputeClientImpl) vmClient(subscriptionID string) (*armcompute.VirtualMachinesClient, error) {
-	return armcompute.NewVirtualMachinesClient(subscriptionID, c.cred, nil)
+func newAzureTagsClient(cred azcore.TokenCredential, opts *arm.ClientOptions) (*azureComputeClientImpl, error) {
+	// The *AtScope methods address the VM by its full resource ID, so the
+	// client's subscription ID is never used.
+	tags, err := armresources.NewTagsClient("", cred, opts)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create Azure tags client: %v", err)
+	}
+	return &azureComputeClientImpl{tags: tags}, nil
 }
 
-func (c *azureComputeClientImpl) vmssVMClient(subscriptionID string) (*armcompute.VirtualMachineScaleSetVMsClient, error) {
-	return armcompute.NewVirtualMachineScaleSetVMsClient(subscriptionID, c.cred, nil)
-}
-
-// GetInstanceTags fetches the current tags on the VM (or VMSS VM instance).
+// GetInstanceTags fetches the current tags on the VM.
 func (c *azureComputeClientImpl) GetInstanceTags(ctx context.Context, res azureVMResource) (map[string]string, error) {
-	if res.isVMSS() {
-		client, err := c.vmssVMClient(res.SubscriptionID)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := client.Get(ctx, res.ResourceGroup, res.VMSSName, res.InstanceID, nil)
-		if err != nil {
-			return nil, err
-		}
-		return derefAzureTags(resp.Tags), nil
-	}
-
-	client, err := c.vmClient(res.SubscriptionID)
+	resp, err := c.tags.GetAtScope(ctx, res.scope(), nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.Get(ctx, res.ResourceGroup, res.VMName, nil)
-	if err != nil {
-		return nil, err
+	if resp.Properties == nil {
+		return map[string]string{}, nil
 	}
-	return derefAzureTags(resp.Tags), nil
+	return derefAzureTags(resp.Properties.Tags), nil
 }
 
-// SetInstanceTags replaces the resource's tags with desiredTags. It GETs the
-// resource first (to preserve required fields like Location and Properties),
-// overwrites Tags, and PUTs/PATCHes it back, polling the long-running
-// operation to completion. Unmanaged tags must already be preserved by the
-// caller in desiredTags.
+// SetInstanceTags replaces the VM's tags with desiredTags using a Tags API
+// "Replace" patch. Unmanaged tags must already be preserved by the caller in
+// desiredTags.
 func (c *azureComputeClientImpl) SetInstanceTags(ctx context.Context, res azureVMResource, desiredTags map[string]string) error {
-	tagMap := toAzureTags(desiredTags)
-
-	if res.isVMSS() {
-		client, err := c.vmssVMClient(res.SubscriptionID)
-		if err != nil {
-			return err
-		}
-		resp, err := client.Get(ctx, res.ResourceGroup, res.VMSSName, res.InstanceID, nil)
-		if err != nil {
-			return err
-		}
-		vm := resp.VirtualMachineScaleSetVM
-		vm.Tags = tagMap
-		poller, err := client.BeginUpdate(ctx, res.ResourceGroup, res.VMSSName, res.InstanceID, vm, nil)
-		if err != nil {
-			return err
-		}
-		_, err = poller.PollUntilDone(ctx, nil)
-		return err
-	}
-
-	client, err := c.vmClient(res.SubscriptionID)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Get(ctx, res.ResourceGroup, res.VMName, nil)
-	if err != nil {
-		return err
-	}
-	vm := resp.VirtualMachine
-	vm.Tags = tagMap
-	poller, err := client.BeginCreateOrUpdate(ctx, res.ResourceGroup, res.VMName, vm, nil)
+	poller, err := c.tags.BeginUpdateAtScope(ctx, res.scope(), armresources.TagsPatchResource{
+		Operation:  to.Ptr(armresources.TagsPatchOperationReplace),
+		Properties: &armresources.Tags{Tags: toAzureTags(desiredTags)},
+	}, nil)
 	if err != nil {
 		return err
 	}
@@ -177,14 +131,16 @@ func toAzureTags(tags map[string]string) map[string]*string {
 }
 
 // parseAzureProviderID parses an Azure provider ID emitted by the Azure cloud
-// provider integration for a Kubernetes node. Both standalone VM and VMSS
-// instance forms are accepted:
+// provider integration for a Kubernetes node:
 //
 //	azure:///subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachines/<vm>
-//	azure:///subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/virtualMachineScaleSets/<vmss>/virtualMachines/<instance>
 //
 // The leading "azure://" prefix and any immediately-following slash (the
 // cloud provider emits three slashes) are both trimmed.
+//
+// Uniform VMSS instances (.../virtualMachineScaleSets/<vmss>/virtualMachines/<id>)
+// are rejected: the Tags API does not support that resource type. Flexible
+// VMSS instances are standalone virtualMachines resources and are supported.
 func parseAzureProviderID(providerID string) (azureVMResource, error) {
 	const prefix = "azure://"
 	if !strings.HasPrefix(providerID, prefix) {
@@ -196,7 +152,7 @@ func parseAzureProviderID(providerID string) (azureVMResource, error) {
 	trimmed = strings.TrimLeft(trimmed, "/")
 
 	parts := strings.Split(trimmed, "/")
-	// Expected: subscriptions <sub> resourceGroups <rg> providers Microsoft.Compute <provider> <name> [virtualMachines <instance>]
+	// Expected: subscriptions <sub> resourceGroups <rg> providers Microsoft.Compute <provider> <name>
 	const minLen = 8
 	if len(parts) < minLen {
 		return azureVMResource{}, fmt.Errorf("invalid Azure provider ID format: %q", providerID)
@@ -205,27 +161,18 @@ func parseAzureProviderID(providerID string) (azureVMResource, error) {
 		return azureVMResource{}, fmt.Errorf("invalid Azure provider ID format: %q", providerID)
 	}
 
-	res := azureVMResource{
-		SubscriptionID: parts[1],
-		ResourceGroup:  parts[3],
-		Provider:       parts[6],
-	}
-
-	switch res.Provider {
+	switch parts[6] {
 	case "virtualMachines":
-		res.VMName = parts[7]
+		return azureVMResource{
+			SubscriptionID: parts[1],
+			ResourceGroup:  parts[3],
+			VMName:         parts[7],
+		}, nil
 	case "virtualMachineScaleSets":
-		// .../virtualMachineScaleSets/<vmss>/virtualMachines/<instance>
-		if len(parts) < 10 || parts[8] != "virtualMachines" {
-			return azureVMResource{}, fmt.Errorf("invalid Azure VMSS provider ID format: %q", providerID)
-		}
-		res.VMSSName = parts[7]
-		res.InstanceID = parts[9]
+		return azureVMResource{}, fmt.Errorf("uniform VMSS instances are not supported (the Azure Tags API cannot tag virtualMachineScaleSets/virtualMachines): %q", providerID)
 	default:
-		return azureVMResource{}, fmt.Errorf("unsupported Azure compute provider type %q in provider ID: %q", res.Provider, providerID)
+		return azureVMResource{}, fmt.Errorf("unsupported Azure compute provider type %q in provider ID: %q", parts[6], providerID)
 	}
-
-	return res, nil
 }
 
 // sanitizeKeyForAzure sanitizes a Kubernetes label/annotation key to fit Azure's

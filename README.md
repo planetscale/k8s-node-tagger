@@ -18,6 +18,16 @@ See the [./examples](./examples) directory for example manifests. These are just
 
 Either `-labels` or `-annotations` must be specified.
 
+## Azure
+
+The controller writes VM tags through the Azure Tags API (`Microsoft.Resources/tags`), not by updating the VM itself. Grant its identity the built-in `Tag Contributor` role on the node resource group, or a custom role with:
+
+- `Microsoft.Resources/tags/read`
+- `Microsoft.Resources/tags/write`
+- `Microsoft.Compute/virtualMachines/read`
+
+Only standalone VM nodes (including flexible VMSS instances) are supported. The Tags API cannot tag uniform VMSS instances, so those nodes fail to reconcile with an error.
+
 ## Testing
 
 - lint: `make lint`
