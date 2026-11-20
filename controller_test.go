@@ -362,9 +362,10 @@ func TestReconcileAzure(t *testing.T) {
 		node              mockNode
 		currentTags       map[string]string
 		wantTags          map[string]string
+		wantErr           bool
 	}{
 		{
-			name:              "sync tags from --annotations (vmss instance)",
+			name:              "sync tags from --annotations",
 			annotationsToCopy: []string{"region", "instance-type"},
 			node: mockNode{
 				Name: "node1",
@@ -372,7 +373,7 @@ func TestReconcileAzure(t *testing.T) {
 					"region":        "eastus",
 					"instance-type": "Standard_D2s_v5",
 				},
-				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/0",
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
 			},
 			currentTags: map[string]string{},
 			wantTags: map[string]string{
@@ -381,7 +382,7 @@ func TestReconcileAzure(t *testing.T) {
 			},
 		},
 		{
-			name:         "sync tags from --labels (standalone vm)",
+			name:         "sync tags from --labels",
 			labelsToCopy: []string{"region", "instance-type"},
 			node: mockNode{
 				Name: "node1",
@@ -423,7 +424,7 @@ func TestReconcileAzure(t *testing.T) {
 					"env":  "prod",
 					"team": "platform",
 				},
-				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/1",
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachines/aks-node-1",
 			},
 			currentTags: map[string]string{
 				"env": "staging",
@@ -483,6 +484,24 @@ func TestReconcileAzure(t *testing.T) {
 				"cost-center": "12345",
 			},
 		},
+		{
+			name:         "uniform vmss instance is rejected",
+			labelsToCopy: []string{"env"},
+			node: mockNode{
+				Name: "node1",
+				Labels: map[string]string{
+					"env": "prod",
+				},
+				ProviderID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/0",
+			},
+			currentTags: map[string]string{
+				"cost-center": "12345",
+			},
+			wantTags: map[string]string{
+				"cost-center": "12345",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -509,7 +528,11 @@ func TestReconcileAzure(t *testing.T) {
 			_, err := r.Reconcile(context.Background(), ctrl.Request{
 				NamespacedName: client.ObjectKey{Name: tt.node.Name},
 			})
-			require.NoError(t, err)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
 
 			assert.Equal(t, tt.wantTags, mock.tags)
 		})
@@ -529,20 +552,13 @@ func TestParseAzureProviderID(t *testing.T) {
 			wantRes: azureVMResource{
 				SubscriptionID: "sub-123",
 				ResourceGroup:  "mc-rg",
-				Provider:       "virtualMachines",
 				VMName:         "aks-node-1",
 			},
 		},
 		{
-			name:       "vmss instance",
+			name:       "uniform vmss instance",
 			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool/virtualMachines/0",
-			wantRes: azureVMResource{
-				SubscriptionID: "sub-123",
-				ResourceGroup:  "mc-rg",
-				Provider:       "virtualMachineScaleSets",
-				VMSSName:       "aks-pool",
-				InstanceID:     "0",
-			},
+			wantErr:    true,
 		},
 		{
 			name:       "two-slash prefix",
@@ -550,7 +566,6 @@ func TestParseAzureProviderID(t *testing.T) {
 			wantRes: azureVMResource{
 				SubscriptionID: "sub-123",
 				ResourceGroup:  "mc-rg",
-				Provider:       "virtualMachines",
 				VMName:         "aks-node-1",
 			},
 		},
@@ -562,11 +577,6 @@ func TestParseAzureProviderID(t *testing.T) {
 		{
 			name:       "empty provider ID",
 			providerID: "",
-			wantErr:    true,
-		},
-		{
-			name:       "truncated vmss path",
-			providerID: "azure:///subscriptions/sub-123/resourceGroups/mc-rg/providers/Microsoft.Compute/virtualMachineScaleSets/aks-pool",
 			wantErr:    true,
 		},
 		{
